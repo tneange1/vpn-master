@@ -31,6 +31,13 @@ def generate_keypair(comment: str = "vpn-master") -> tuple[str, str]:
     return k.export_private_key().decode(), k.export_public_key().decode().strip()
 
 
+def normalize_public(line: str) -> str:
+    """Проверяет публичный ключ OpenSSH и возвращает его одной строкой (с комментарием)."""
+    line = " ".join(line.split())
+    asyncssh.import_public_key(line)
+    return line
+
+
 def public_from_private(pem: str) -> str:
     return asyncssh.import_private_key(pem).export_public_key().decode().strip()
 

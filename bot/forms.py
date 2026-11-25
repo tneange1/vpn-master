@@ -113,6 +113,18 @@ def _convert(f: Field, v: str):
         if not DOMAIN_RE.match(v):
             raise ValueError("это не похоже на домен, пример: <code>panel.example.com</code>")
         return v
+    if f.kind == "domains":
+        out = []
+        for d in re.split(r"[,\s]+", v.strip().lower()):
+            if not d:
+                continue
+            d = re.sub(r"^https?://", "", d).strip("/")
+            if not DOMAIN_RE.match(d):
+                raise ValueError(f"<code>{h(d)}</code> не похоже на домен")
+            out.append(d)
+        if not out:
+            raise ValueError("нужен хотя бы один домен")
+        return ",".join(dict.fromkeys(out))
     if f.kind == "ids":
         ids = [x for x in re.split(r"[,\s]+", v) if x]
         if not ids or not all(x.lstrip("-").isdigit() for x in ids):
@@ -145,6 +157,40 @@ async def on_text(m: Message, state: FSMContext):
     values[f.key] = value
     await state.update_data(values=values)
     await _next(m, state)
+
+
+@router.message(FormSt.filling, F.document)
+async def on_document(m: Message, state: FSMContext):
+    """Файл вместо текста (например, приватный/публичный ключ)."""
+    data = await state.get_data()
+    f: Field = FORMS[data["form"]].fields[data["idx"]]
+    if f.kind != "raw":
+        await m.answer("Тут нужен текст, а не файл.")
+        return
+    if m.document.file_size and m.document.file_size > 64 * 1024:
+        await m.answer("⚠️ Файл больше 64 КБ — это точно ключ?")
+        return
+    buf = await m.bot.download(m.document)
+    try:
+        text = buf.read().decode("utf-8")
+    except UnicodeDecodeError:
+        await m.answer("⚠️ Файл не текстовый. Нужен ключ в формате OpenSSH/PEM.")
+        return
+    if f.secret:
+        try:
+            await m.delete()
+        except TelegramBadRequest:
+            pass
+    values = data["values"]
+    values[f.key] = text
+    values.setdefault("_filename", m.document.file_name)
+    await state.update_data(values=values)
+    await _next(m, state)
+
+
+@router.message(FormSt.filling)
+async def on_other(m: Message):
+    await m.answer("Жду текст (или файл, если просят ключ).")
 
 
 @router.callback_query(FormSt.filling, F.data.startswith("f:c:"))

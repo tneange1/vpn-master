@@ -12,12 +12,33 @@ from ..ui import chat_id, h, kb, say, show
 
 router = Router(name="servers")
 
+
+async def mark_deploy(key_id: int, server_id: int, on: bool) -> None:
+    from sqlalchemy import delete as sa_delete
+    async with db.Session() as ses:
+        if on:
+            await ses.merge(db.KeyDeploy(key_id=key_id, server_id=server_id))
+        else:
+            await ses.execute(sa_delete(db.KeyDeploy).where(db.KeyDeploy.key_id == key_id,
+                                                           db.KeyDeploy.server_id == server_id))
+        await ses.commit()
+
+
+async def server_label(s: db.Server) -> str:
+    """«🛰 NL-1 · нода MikaelaVPN» — сервер с его ролями."""
+    panels = await db.all_(db.Panel, db.Panel.server_id == s.id)
+    nodes = await db.all_(db.Node, db.Node.server_id == s.id)
+    bots = await db.all_(db.Bedolaga, db.Bedolaga.server_id == s.id)
+    roles = [f"панель {p.name}" for p in panels] + [f"нода {n.name}" for n in nodes] + [f"бот {b.name}" for b in bots]
+    icon = "🖥" if panels else "🛰" if nodes else "🤖" if bots else "💻"
+    return f"{icon} {s.name}" + (f" · {', '.join(roles)}" if roles else "")
+
 AUTH_LABEL = {"password": "🔒 пароль", "key": "🔑 ключ"}
 
 
 # ---------------------------------------------------------------- общие поля «какой сервер»
 async def server_choices(values, ctx, allow_none=False):
-    rows = [(f"🖥 {s.name} · {s.host}", s.id) for s in await db.all_(db.Server)]
+    rows = [(f"{await server_label(s)} · {s.host}", s.id) for s in await db.all_(db.Server)]
     rows.append(("➕ Новый сервер", "new"))
     if allow_none or ctx.get("allow_none"):
         rows.append(("— без SSH (только API)", "none"))
@@ -25,7 +46,7 @@ async def server_choices(values, ctx, allow_none=False):
 
 
 async def key_choices(values, ctx):
-    return [(f"🔑 {k.name}", k.id) for k in await db.all_(db.SshKey)]
+    return [(f"🔑 {k.name}", k.id) for k in await db.all_(db.SshKey) if k.private_enc]
 
 
 def _new(v):
@@ -53,7 +74,7 @@ SERVER_FIELDS = [
           when=lambda v: _new(v) and v.get("s_auth") == "genkey"),
     Field("s_key", "Какой ключ? (он уже должен быть в authorized_keys сервера)", "choice", choices=key_choices,
           when=lambda v: _new(v) and v.get("s_auth") == "key"),
-    Field("s_paste", "Пришли приватный ключ целиком (OpenSSH/PEM). Сообщение удалю.", "raw", secret=True,
+    Field("s_paste", "Пришли приватный ключ <b>файлом</b> (например <code>id_ed25519</code>) или текстом. Сообщение удалю.", "raw", secret=True,
           when=lambda v: _new(v) and v.get("s_auth") == "paste"),
 ]
 
@@ -93,6 +114,8 @@ async def ensure_server(event, values) -> db.Server | None:
     if not ok:
         await db.delete(s)
         raise RuntimeError(f"не удалось подключиться к {s.host}: {info}")
+    if s.key_id:
+        await mark_deploy(s.key_id, s.id, True)
 
     if auth == "genkey":
         priv, pub = ssh.generate_keypair(f"vpn-master@{s.name}")
@@ -102,6 +125,7 @@ async def ensure_server(event, values) -> db.Server | None:
             raise RuntimeError(f"не удалось поставить ключ: {out[-500:]}")
         s.key_id, s.auth = k.id, "key"
         s = await db.save(s)
+        await mark_deploy(k.id, s.id, True)
         ok_key, info_key = await ssh.check(s, use_password=False)
         if not ok_key:
             await say(event, f"⚠️ Ключ поставлен, но вход по ключу не прошёл: <code>{h(info_key)}</code>\n"
@@ -127,7 +151,7 @@ async def access_menu(c: CallbackQuery):
 @router.callback_query(F.data == "srv:list")
 async def srv_list(c: CallbackQuery):
     servers = await db.all_(db.Server)
-    rows = [[(f"🖥 {s.name} · {s.host} · {AUTH_LABEL.get(s.auth, s.auth)}", f"srv:v:{s.id}")] for s in servers]
+    rows = [[(f"{await server_label(s)} · {AUTH_LABEL.get(s.auth, s.auth)}", f"srv:v:{s.id}")] for s in servers]
     rows.append([("➕ Добавить сервер", "srv:add")])
     rows.append([("⬅️ Назад", "acc")])
     await show(c, f"🖥 <b>Серверы</b> ({len(servers)})", kb(*rows))
@@ -233,6 +257,7 @@ async def install_key(event, bot: Bot, s: db.Server, key: db.SshKey) -> bool:
     res = await run_task(bot, chat_id(event), s, "Установка SSH-ключа", scripts.ssh_add_key(s.username, key.public))
     if not res.ok:
         return False
+    await mark_deploy(key.id, s.id, True)
     old_key, old_auth = s.key_id, s.auth
     s.key_id, s.auth = key.id, "key"
     s = await db.save(s)
@@ -259,7 +284,7 @@ async def srv_genkey(c: CallbackQuery, bot: Bot):
 async def srv_pickkey(c: CallbackQuery):
     i = c.data.split(":")[2]
     keys = await db.all_(db.SshKey)
-    rows = [[(f"🔑 {k.name}", f"srv:uk:{i}:{k.id}")] for k in keys] or [[("Ключей нет", "noop")]]
+    rows = [[(f"🔑 {k.name}", f"srv:uk:{i}:{k.id}")] for k in keys if k.private_enc] or [[("Ключей с приватной частью нет", "noop")]]
     rows.append([("⬅️ Назад", f"srv:auth:{i}")])
     await show(c, "Какой ключ поставить на сервер?", kb(*rows))
 
@@ -323,76 +348,6 @@ async def srv_cmd_done(event, values, ctx):
 @router.callback_query(F.data.startswith("srv:cmd:"))
 async def srv_cmd(c: CallbackQuery, state: FSMContext):
     await start_form(c, state, "srv_cmd", ctx={"id": int(c.data.split(":")[2])})
-
-
-# ---------------------------------------------------------------- SSH-ключи
-@router.callback_query(F.data == "key:list")
-async def key_list(c: CallbackQuery):
-    keys = await db.all_(db.SshKey)
-    rows = [[(f"🔑 {k.name}", f"key:v:{k.id}")] for k in keys]
-    rows.append([("✨ Сгенерировать", "key:gen"), ("📥 Импортировать", "key:imp")])
-    rows.append([("⬅️ Назад", "acc")])
-    await show(c, f"🔑 <b>SSH-ключи</b> ({len(keys)})\nПриватные ключи хранятся в БД в зашифрованном виде.", kb(*rows))
-
-
-@form("key_gen", "✨ Новый ключ ed25519", [Field("name", "Название ключа:")])
-async def key_gen_done(event, values, ctx):
-    priv, pub = ssh.generate_keypair(f"vpn-master-{values['name']}")
-    k = await db.save(db.SshKey(name=values["name"], private_enc=crypto.enc(priv), public=pub))
-    await say(event, f"✅ Ключ <b>{h(k.name)}</b> создан.\n<code>{h(pub)}</code>",
-              kb([("Открыть", f"key:v:{k.id}"), ("⬅️ Ключи", "key:list")]))
-
-
-@router.callback_query(F.data == "key:gen")
-async def key_gen(c: CallbackQuery, state: FSMContext):
-    await start_form(c, state, "key_gen")
-
-
-@form("key_imp", "📥 Импорт ключа", [
-    Field("name", "Название ключа:"),
-    Field("pem", "Пришли приватный ключ целиком (сообщение удалю):", "raw", secret=True)])
-async def key_imp_done(event, values, ctx):
-    pem = values["pem"].strip() + "\n"
-    try:
-        pub = ssh.public_from_private(pem)
-    except Exception as e:  # noqa: BLE001
-        await say(event, f"❌ Не смог прочитать ключ: <code>{h(e)}</code>", kb([("⬅️ Ключи", "key:list")]))
-        return
-    k = await db.save(db.SshKey(name=values["name"], private_enc=crypto.enc(pem), public=pub))
-    await say(event, f"✅ Ключ <b>{h(k.name)}</b> импортирован.", kb([("⬅️ Ключи", "key:list")]))
-
-
-@router.callback_query(F.data == "key:imp")
-async def key_imp(c: CallbackQuery, state: FSMContext):
-    await start_form(c, state, "key_imp")
-
-
-@router.callback_query(F.data.startswith("key:v:"))
-async def key_view(c: CallbackQuery):
-    k = await db.get(db.SshKey, c.data.split(":")[2])
-    used = await db.all_(db.Server, db.Server.key_id == k.id)
-    await show(c, f"🔑 <b>{h(k.name)}</b>\nИспользуется: {h(', '.join(s.name for s in used)) or '—'}\n\n"
-                  f"Публичный ключ:\n<code>{h(k.public)}</code>",
-               kb([("📄 Скачать приватный", f"key:dl:{k.id}"), ("🗑 Удалить", f"key:del:{k.id}")],
-                  [("⬅️ Ключи", "key:list")]))
-
-
-@router.callback_query(F.data.startswith("key:dl:"))
-async def key_dl(c: CallbackQuery):
-    k = await db.get(db.SshKey, c.data.split(":")[2])
-    await c.answer()
-    await c.message.answer_document(BufferedInputFile(crypto.dec(k.private_enc).encode(), filename=f"{k.name}_ed25519"),
-                                    caption="Приватный ключ. Не пересылай никому.")
-
-
-@router.callback_query(F.data.startswith("key:del:"))
-async def key_del(c: CallbackQuery):
-    k = await db.get(db.SshKey, c.data.split(":")[2])
-    used = await db.all_(db.Server, db.Server.key_id == k.id)
-    if used:
-        return await c.answer("Ключ используется серверами: " + ", ".join(s.name for s in used), show_alert=True)
-    await db.delete(k)
-    await key_list(c)
 
 
 # ---------------------------------------------------------------- логины/токены панелей и ботов

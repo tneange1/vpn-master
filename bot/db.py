@@ -25,8 +25,15 @@ class SshKey(Stamp, Base):
     __tablename__ = "ssh_keys"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
-    private_enc: Mapped[str] = mapped_column(Text)
+    private_enc: Mapped[str | None] = mapped_column(Text)  # None — только публичный ключ
     public: Mapped[str] = mapped_column(Text)
+
+
+class KeyDeploy(Base):
+    """На каких серверах публичный ключ стоит в authorized_keys."""
+    __tablename__ = "key_deploys"
+    key_id: Mapped[int] = mapped_column(ForeignKey("ssh_keys.id", ondelete="CASCADE"), primary_key=True)
+    server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"), primary_key=True)
 
 
 class Server(Stamp, Base):
@@ -117,9 +124,18 @@ class Log(Stamp, Base):
     meta: Mapped[dict | None] = mapped_column(JSONB)
 
 
+# Простые миграции для уже работающих баз (create_all не добавляет колонки).
+MIGRATIONS = [
+    "ALTER TABLE ssh_keys ALTER COLUMN private_enc DROP NOT NULL",
+]
+
+
 async def init() -> None:
+    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for sql in MIGRATIONS:
+            await conn.execute(text(sql))
 
 
 # ---------- хелперы ----------

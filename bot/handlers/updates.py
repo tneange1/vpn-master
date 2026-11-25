@@ -9,7 +9,7 @@ from ..ui import h, kb, say, show
 router = Router(name="updates")
 
 LABEL = {"panel": "Панель Remnawave", "subpage": "Страница подписки", "caddy": "Caddy",
-         "node": "Нода", "selfsteal": "Self-steal Caddy", "bedolaga": "Bedolaga Bot",
+         "node": "Нода", "selfsteal": "Self-steal Nginx", "bedolaga": "Bedolaga Bot",
          "cabinet": "Bedolaga Cabinet", "link_extractor": "Link Extractor", "backup_restore": "rw-backup"}
 
 
@@ -35,7 +35,7 @@ async def upd_panel(c: CallbackQuery):
             rows += [[("🧭 Caddy", f"upd:run:caddy:{s}")]]
         if p.link_extractor:
             rows += [[("🔗 Link Extractor", f"upd:run:link_extractor:{s}")]]
-    rows += [[(f"🛰 Нода {n.name}", f"upd:run:node:{n.id}"), ("self-steal", f"upd:run:selfsteal:{n.id}")] for n in nodes]
+    rows += [[(f"🛰 Нода {n.name}", f"upd:run:node:{n.id}"), ("nginx self-steal", f"upd:run:selfsteal:{n.id}")] for n in nodes]
     if nodes:
         rows.append([("🛰 Все ноды панели по очереди", f"upd:allnodes:{p.id}")])
     rows.append([("⬅️ Обновления", "upd")])

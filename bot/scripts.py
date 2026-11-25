@@ -212,53 +212,109 @@ docker compose up -d
 """)
 
 
-# ===================================================================== Нода
-def node_install(secret_key: str, domain: str | None, selfsteal: bool, panel_ip: str | None) -> str:
-    parts = ["need_docker"]
-    if selfsteal and domain:
-        parts.append(f"""
-log "Ставлю self-steal Caddy для {domain}"
-mkdir -p /opt/selfsteal/html /opt/selfsteal/data && cd /opt/selfsteal
-if [ ! -f html/index.html ]; then
-cat > html/index.html <<'VMEOF'
-<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Welcome</title>
+# ===================================================================== Нода (self-steal по мануалу)
+CERTBOT_DIR = "/opt/certbot"
+NGINX_SS_DIR = "/opt/nginx-selfsteal"
+
+SELFSTEAL_HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Сайт в разработке</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{{font-family:system-ui;margin:0;display:grid;place-items:center;height:100vh;background:#f4f4f5;color:#27272a}}</style>
-</head><body><main><h1>Under construction</h1><p>We are working on something new.</p></main></body></html>
+<style>body{font-family:system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:#f4f4f5;color:#27272a}main{text-align:center;padding:24px}h1{font-weight:600}</style>
+</head><body><main><h1>Сайт в разработке</h1><p>Скоро здесь что-то появится.</p></main></body></html>"""
+
+NGINX_SS_CONF = """server {
+    listen 8443 ssl default_server;
+    server_name _;
+
+    ssl_certificate     /etc/letsencrypt/live/key/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/key/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}"""
+
+
+def _certbot_issue(domains: list[str], email: str | None, expand: bool = False) -> str:
+    ds = " ".join(f"-d {q(d)}" for d in domains)
+    mail = f"--email {q(email)}" if email else "--register-unsafely-without-email"
+    return f"""
+log "Выпускаю сертификат (cert-name key): {' '.join(domains)}"
+mkdir -p {CERTBOT_DIR}/certs {CERTBOT_DIR}/var-lib-letsencrypt {CERTBOT_DIR}/logs && cd {CERTBOT_DIR}
+cat > docker-compose.yml <<'VMEOF'
+services:
+  certbot:
+    container_name: certbot
+    image: certbot/certbot
+    network_mode: host
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./var-lib-letsencrypt:/var/lib/letsencrypt
+      - ./logs:/var/log/letsencrypt
 VMEOF
+if ss -ltnH 2>/dev/null | awk '{{print $4}}' | grep -qE '(^|:)80$'; then
+  echo "!! Порт 80 занят — certbot --standalone не сможет пройти проверку:"; ss -ltnp | grep -E ':80\\b' || true; exit 4
 fi
-cat > Caddyfile <<'VMEOF'
-{{
-	https_port 9443
-	http_port 80
-}}
-http://{domain} {{
-	bind 0.0.0.0
-	redir https://{{host}}{{uri}} permanent
-}}
-https://{domain}:9443 {{
-	bind 127.0.0.1
-	root * /var/www/html
-	file_server
-}}
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow 80/tcp >/dev/null; fi
+docker compose run --rm certbot certonly --standalone --non-interactive --agree-tos {mail} \\
+  --cert-name key {'--expand ' if expand else ''}{ds}
+ls -l {CERTBOT_DIR}/certs/live/key/
+"""
+
+
+CERT_RENEW_CRON = f"""
+cat > /etc/cron.d/vpn-master-certbot <<'VMEOF'
+0 0 28 * * root cd {CERTBOT_DIR} && docker compose run --rm certbot renew >> /var/log/vpn-master-certbot.log 2>&1 && docker exec nginx-selfsteal nginx -s reload && docker restart remnanode
+VMEOF
+chmod 644 /etc/cron.d/vpn-master-certbot
+log "Автопродление: /etc/cron.d/vpn-master-certbot (28 числа каждого месяца)"
+"""
+
+
+def node_install(secret_key: str, domains: list[str], selfsteal: bool, panel_ip: str | None,
+                 email: str | None = None) -> str:
+    parts = ["need_docker", "pkg cron iproute2 || true",
+             # старый вариант self-steal на Caddy (ранние версии бота) — убираем
+             "docker rm -f selfsteal >/dev/null 2>&1 || true"]
+    if selfsteal and domains:
+        parts.append(_certbot_issue(domains, email))
+        parts.append(f"""
+log "Ставлю Nginx self-steal на 127.0.0.1:8443"
+mkdir -p {NGINX_SS_DIR}/html && cd {NGINX_SS_DIR}
+[ -f html/index.html ] || cat > html/index.html <<'VMEOF'
+{SELFSTEAL_HTML}
+VMEOF
+cat > default.conf <<'VMEOF'
+{NGINX_SS_CONF}
 VMEOF
 cat > docker-compose.yml <<'VMEOF'
 services:
-  selfsteal:
-    image: caddy:2
-    container_name: selfsteal
-    restart: always
-    network_mode: host
+  nginx-selfsteal:
+    image: nginx:stable-alpine
+    container_name: nginx-selfsteal
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8443:8443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - ./html:/var/www/html
-      - ./data:/data
+      - ./default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./html:/usr/share/nginx/html:ro
+      - {CERTBOT_DIR}/certs:/etc/letsencrypt:ro
 VMEOF
 docker compose up -d
+sleep 2
+docker exec nginx-selfsteal nginx -t
+code=$(curl -sk -o /dev/null -w '%{{http_code}}' --max-time 5 --resolve {q(domains[0])}:8443:127.0.0.1 https://{domains[0]}:8443/ || true)
+log "Self-steal отвечает: HTTP $code"
 """)
+        parts.append(CERT_RENEW_CRON)
     parts.append(f"""
 log "Ставлю Remnawave Node"
-mkdir -p /opt/remnanode && cd /opt/remnanode
+mkdir -p /opt/remnanode {CERTBOT_DIR}/certs && cd /opt/remnanode
 cat > docker-compose.yml <<'VMEOF'
 services:
   remnanode:
@@ -275,19 +331,45 @@ services:
       NODE_PORT: "2222"
       SECRET_KEY: "{secret_key}"
     volumes:
-      - /opt/selfsteal/data:/var/lib/selfsteal:ro
+      - {CERTBOT_DIR}/certs:/etc/letsencrypt:ro
 VMEOF
-docker compose up -d
+docker compose up -d --force-recreate
 """)
     if panel_ip:
         parts.append(f"""
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
   ufw allow from {q(panel_ip)} to any port 2222 proto tcp
-  ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp; ufw allow 8443/udp
+  ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp
 fi
 """)
-    parts.append("sleep 3; docker ps --format 'table {{.Names}}\\t{{.Status}}'")
+    parts.append("sleep 3; docker ps --format 'table {{.Names}}\\t{{.Status}}'\n"
+                 "ss -lntup 2>/dev/null | grep -E ':(443|8443|2222)\\b' || true")
     return _script("\n".join(parts))
+
+
+def cert_issue(domains: list[str], email: str | None, expand: bool = True) -> str:
+    """Перевыпуск/расширение сертификата key (добавить домены) + перезапуск nginx и ноды."""
+    return _script(_certbot_issue(domains, email, expand=expand) + """
+docker exec nginx-selfsteal nginx -s reload 2>/dev/null || true
+docker restart remnanode >/dev/null && log "remnanode перезапущен"
+""" + CERT_RENEW_CRON)
+
+
+CERT_RENEW = _script(f"""
+cd {CERTBOT_DIR} && docker compose run --rm certbot renew
+docker exec nginx-selfsteal nginx -s reload 2>/dev/null || true
+docker restart remnanode >/dev/null && log "remnanode перезапущен"
+""")
+CERT_DRYRUN = _script(f"cd {CERTBOT_DIR} && docker compose run --rm certbot renew --dry-run")
+CERT_STATUS = _script(f"""
+cd {CERTBOT_DIR} 2>/dev/null && docker compose run --rm certbot certificates || echo "certbot не установлен"
+cat /etc/cron.d/vpn-master-certbot 2>/dev/null || echo "крон автопродления не найден"
+""")
+NODE_CHECK = _script("""
+docker ps --format 'table {{.Names}}\\t{{.Status}}'
+echo; ss -lntup 2>/dev/null | grep -E ':(443|8443|2222)\\b' || true
+echo; docker logs --tail 15 remnanode 2>&1 || true
+""")
 
 
 # ===================================================================== Bedolaga
@@ -418,6 +500,8 @@ def ufw_enable(ssh_port: int, rules: list[str]) -> str:
     allow = "\n".join(f"ufw allow {r}" for r in rules)
     return _script(f"""
 pkg ufw
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
 ufw allow {int(ssh_port)}/tcp
 {allow}
 ufw --force enable
@@ -426,11 +510,75 @@ ufw status verbose
 
 
 UFW_DISABLE = _script("command -v ufw >/dev/null && ufw --force disable; ufw status || true")
-UFW_STATUS = _script("command -v ufw >/dev/null && ufw status numbered || echo 'ufw не установлен'")
+UFW_STATUS = _script("""
+command -v ufw >/dev/null || { echo 'ufw не установлен'; exit 0; }
+ufw status verbose | head -4
+echo "IPv6 в UFW: $(grep -E '^IPV6=' /etc/default/ufw | cut -d= -f2)"
+echo "IPv6 в системе: $([ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" = 1 ] && echo выключен || echo включен)"
+echo "Ping: $(grep -qE '^-A ufw-before-input -p icmp --icmp-type echo-request -j DROP' /etc/ufw/before.rules && echo блокируется || echo разрешён)"
+echo; ufw status numbered | tail -n +4
+""")
+# только список правил: «[ 1] 22/tcp ALLOW IN Anywhere» → маркеры для кнопок
+UFW_RULES = _script("""
+command -v ufw >/dev/null || exit 0
+ufw status numbered | grep -E '^\\[ *[0-9]+\\]' | sed -E 's/^\\[ *([0-9]+)\\] +/\\1|/' | while IFS='|' read -r n rest; do
+  mark "R$n" "$(echo "$rest" | tr -s ' ')"
+done
+""")
+UFW_RESET = _script("""
+pkg ufw
+ufw --force reset
+echo "Правила сброшены, UFW выключен. Включи заново кнопкой «Включить UFW»."
+""")
 
 
 def ufw_allow(rule: str) -> str:
     return _script(f"pkg ufw\nufw allow {rule}\nufw status numbered")
+
+
+def ufw_delete(num: int) -> str:
+    return _script(f"ufw --force delete {int(num)}\nufw status numbered")
+
+
+def ufw_ipv6(enabled: bool) -> str:
+    v = "yes" if enabled else "no"
+    return _script(f"""
+pkg ufw
+sed -i 's/^IPV6=.*/IPV6={v}/' /etc/default/ufw
+grep -q '^IPV6=' /etc/default/ufw || echo 'IPV6={v}' >> /etc/default/ufw
+ufw status | grep -q "Status: active" && ufw reload
+echo "IPv6 в UFW: {v}"
+""")
+
+
+def sys_ipv6(enabled: bool) -> str:
+    if enabled:
+        return _script("""
+rm -f /etc/sysctl.d/99-vpn-master-ipv6.conf
+sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+echo "IPv6 в системе включён"; ip -6 addr | grep inet6 | head -5 || true
+""")
+    return _script("""
+cat > /etc/sysctl.d/99-vpn-master-ipv6.conf <<'VMEOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+VMEOF
+sysctl -p /etc/sysctl.d/99-vpn-master-ipv6.conf
+echo "IPv6 в системе выключен (переживёт перезагрузку)"
+""")
+
+
+def ufw_ping(allow: bool) -> str:
+    src, dst = ("DROP", "ACCEPT") if allow else ("ACCEPT", "DROP")
+    return _script(f"""
+pkg ufw
+F=/etc/ufw/before.rules
+cp "$F" "$F.vm.bak"
+sed -i -E 's/^(-A ufw-before-input -p icmp --icmp-type echo-request) -j {src}$/\\1 -j {dst}/' "$F"
+ufw status | grep -q "Status: active" && ufw reload
+echo "Ping: {'разрешён' if allow else 'блокируется'}"
+""")
 
 
 def ssh_add_key(username: str, pubkey: str) -> str:
@@ -445,19 +593,76 @@ echo "Ключ добавлен в $HOME_DIR/.ssh/authorized_keys"
 """)
 
 
+def ssh_remove_key(username: str, pubkey: str) -> str:
+    # сравниваем по типу+телу ключа, комментарий не важен
+    body = " ".join(pubkey.split()[:2])
+    return _script(f"""
+U={q(username)}
+HOME_DIR=$(getent passwd "$U" | cut -d: -f6)
+F="$HOME_DIR/.ssh/authorized_keys"
+[ -f "$F" ] || {{ echo "authorized_keys нет"; exit 0; }}
+cp "$F" "$F.vm.bak"
+grep -vF {q(body)} "$F.vm.bak" > "$F" || true
+chmod 600 "$F"
+echo "Ключ убран из $F (копия: $F.vm.bak)"
+""")
+
+
+SSHD_RELOAD = r"""
+sshd -t
+if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+  systemctl daemon-reload; systemctl restart ssh.socket; systemctl restart ssh 2>/dev/null || true
+else
+  systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || service ssh restart
+fi
+"""
+SSHD_INCLUDE = r"""
+mkdir -p /etc/ssh/sshd_config.d
+grep -qE '^\s*Include\s+/etc/ssh/sshd_config.d' /etc/ssh/sshd_config || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+"""
+
+
 def ssh_password_auth(enabled: bool) -> str:
     val = "yes" if enabled else "no"
-    return _script(f"""
-mkdir -p /etc/ssh/sshd_config.d
-grep -qE '^\\s*Include\\s+/etc/ssh/sshd_config.d' /etc/ssh/sshd_config || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+    return _script(SSHD_INCLUDE + f"""
 cat > /etc/ssh/sshd_config.d/00-vpn-master.conf <<'VMEOF'
 PasswordAuthentication {val}
 KbdInteractiveAuthentication {val}
 PubkeyAuthentication yes
 VMEOF
-sshd -t
-systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload
-echo "PasswordAuthentication = $(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{{print $2}}')"
+""" + SSHD_RELOAD + """
+echo "PasswordAuthentication = $(sshd -T 2>/dev/null | grep -i '^passwordauthentication' | awk '{print $2}')"
+""")
+
+
+def ssh_root_login(mode: str) -> str:
+    assert mode in ("yes", "prohibit-password", "no")
+    return _script(SSHD_INCLUDE + f"""
+echo 'PermitRootLogin {mode}' > /etc/ssh/sshd_config.d/02-vpn-master-root.conf
+""" + SSHD_RELOAD + """
+echo "PermitRootLogin = $(sshd -T 2>/dev/null | grep -i '^permitrootlogin' | awk '{print $2}')"
+""")
+
+
+def ssh_ports(ports: list[int], close_port: int | None = None) -> str:
+    """Шаг смены порта: слушать на ports (сначала старый+новый, потом только новый)."""
+    lines = "\n".join(f"Port {int(p)}" for p in ports)
+    ufw = "\n".join(f"ufw allow {int(p)}/tcp >/dev/null" for p in ports)
+    close = (f"ufw delete allow {int(close_port)}/tcp >/dev/null 2>&1 || true\n"
+             f"echo 'Порт {int(close_port)} закрыт в UFW'") if close_port else ""
+    return _script(SSHD_INCLUDE + f"""
+# Port из основного конфига мешает — комментируем
+sed -i -E 's/^\\s*Port\\s+/#&/' /etc/ssh/sshd_config
+cat > /etc/ssh/sshd_config.d/01-vpn-master-port.conf <<'VMEOF'
+{lines}
+VMEOF
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+{ufw}
+{close}
+fi
+""" + SSHD_RELOAD + """
+sleep 1
+echo "sshd слушает:"; ss -ltnp 2>/dev/null | grep -E 'sshd|systemd' | awk '{print $4}' | sort -u
 """)
 
 
@@ -472,7 +677,7 @@ UPDATES = {
     "subpage": _script(_compose_restart("/opt/remnawave/subscription")),
     "caddy": _script(_compose_restart(CADDY_DIR) + "\ncaddy_networks"),
     "node": _script(_compose_restart("/opt/remnanode") + "\ndocker image prune -f >/dev/null || true"),
-    "selfsteal": _script(_compose_restart("/opt/selfsteal")),
+    "selfsteal": _script(_compose_restart(NGINX_SS_DIR)),
     "cabinet": _script(_compose_restart(CABINET_DIR)),
     "link_extractor": _script("cd /opt/link-extractor && git pull --ff-only && docker compose up -d --build"),
     "backup_restore": BACKUP_RESTORE_UPDATE,

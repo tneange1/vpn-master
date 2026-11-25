@@ -28,5 +28,16 @@ services:
       db:
         condition: service_healthy
 
+  # автообновление бота из git (настройки — в боте: ⚙️ Бот → Обновление)
+  updater:
+    image: docker:cli
+    container_name: vpn-master-updater
+    restart: always
+    working_dir: ${PWD}
+    entrypoint: ["sh", "./updater.sh"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
+
 volumes:
   db-data:

@@ -1,4 +1,10 @@
-"""Шаблоны профилей Xray для Remnawave: VLESS TCP Reality (self-steal) и Hysteria2."""
+"""Шаблоны профилей Xray для Remnawave (по мануалу self-steal):
+
+- Hysteria 2 на UDP 443 (BBR через finalmask.quicParams)
+- VLESS + REALITY self-steal на TCP 443, network raw (Vision: flow xtls-rprx-vision ставит панель)
+- Nginx self-steal на 127.0.0.1:8443
+- Один сертификат certbot с --cert-name key → /etc/letsencrypt/live/key/ (все домены ноды в SAN)
+"""
 import base64
 import copy
 import secrets
@@ -6,15 +12,14 @@ import secrets
 from cryptography.hazmat.primitives import serialization as ser
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
-# self-steal Caddy на ноде слушает 127.0.0.1:9443, его сертификаты монтируются в ноду сюда:
-SELFSTEAL_PORT = 9443
-CERT_ROOT = "/var/lib/selfsteal/caddy/certificates/acme-v02.api.letsencrypt.org-directory"
-HY2_PORT = 8443
+SELFSTEAL_TARGET = "127.0.0.1:8443"
+CERT_FILE = "/etc/letsencrypt/live/key/fullchain.pem"
+KEY_FILE = "/etc/letsencrypt/live/key/privkey.pem"
 
 KINDS = {
-    "reality": "VLESS TCP Reality (self-steal)",
-    "hy2": "Hysteria2",
-    "both": "Reality + Hysteria2",
+    "both": "Reality + Hysteria2 (оба на 443)",
+    "reality": "VLESS Reality self-steal (TCP 443)",
+    "hy2": "Hysteria2 (UDP 443)",
 }
 
 WARP_DOMAINS = [
@@ -35,66 +40,61 @@ def x25519() -> tuple[str, str]:
     return b64(priv), b64(pub)
 
 
-def reality_inbound(domain: str, tag: str = "VLESS_REALITY", port: int = 443) -> dict:
+def reality_inbound(domains: list[str], tag: str = "VLESS-SELFSTEAL", port: int = 443) -> dict:
     priv, _pub = x25519()
     return {
         "tag": tag,
-        "listen": "0.0.0.0",
         "port": port,
+        "listen": "0.0.0.0",
         "protocol": "vless",
         "settings": {"clients": [], "decryption": "none"},
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+        "sniffing": {"enabled": True, "routeOnly": True, "destOverride": ["http", "tls", "quic"]},
         "streamSettings": {
-            "network": "tcp",
+            "network": "raw",
             "security": "reality",
             "realitySettings": {
-                "show": False,
-                "xver": 0,
-                "target": f"127.0.0.1:{SELFSTEAL_PORT}",
-                "spiderX": "",
-                "serverNames": [domain],
+                "target": SELFSTEAL_TARGET,
                 "privateKey": priv,
                 "shortIds": [secrets.token_hex(8)],
+                "serverNames": list(domains),
             },
         },
     }
 
 
-def hysteria_inbound(domain: str, tag: str = "HYSTERIA2", port: int = HY2_PORT) -> dict:
-    # Hysteria2 в Xray-core (протокол "hysteria", version 2). Сертификат берём у self-steal Caddy.
-    # Схема у Xray ещё развивается — если панель ругается, поправь профиль под свою версию ядра.
+def hysteria_inbound(tag: str = "HYSTERIA-BBR", port: int = 443, bbr: bool = True) -> dict:
+    stream = {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": {
+            "alpn": ["h3"],
+            "certificates": [{"keyFile": KEY_FILE, "certificateFile": CERT_FILE}],
+        },
+        "hysteriaSettings": {"version": 2},
+    }
+    if bbr:  # finalmask зависит от версии ноды
+        stream["finalmask"] = {"quicParams": {"debug": False, "congestion": "bbr"}}
     return {
         "tag": tag,
-        "listen": "0.0.0.0",
         "port": port,
+        "listen": "0.0.0.0",
         "protocol": "hysteria",
-        "settings": {"version": 2, "clients": []},
-        "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
-        "streamSettings": {
-            "network": "hysteria",
-            "hysteriaSettings": {"version": 2},
-            "security": "tls",
-            "tlsSettings": {
-                "serverName": domain,
-                "alpn": ["h3"],
-                "certificates": [{
-                    "certificateFile": f"{CERT_ROOT}/{domain}/{domain}.crt",
-                    "keyFile": f"{CERT_ROOT}/{domain}/{domain}.key",
-                }],
-            },
-        },
+        "settings": {"clients": [], "version": 2},
+        "streamSettings": stream,
     }
 
 
-def build_profile(kind: str, domain: str, prefix: str = "") -> dict:
-    p = (prefix.upper().replace("-", "_") + "_") if prefix else ""
+def build_profile(kind: str, domains: list[str] | str, prefix: str = "", bbr: bool = True) -> dict:
+    if isinstance(domains, str):
+        domains = [d for d in domains.split(",") if d]
+    p = (prefix.upper().replace(" ", "-") + "-") if prefix else ""
     inbounds = []
-    if kind in ("reality", "both"):
-        inbounds.append(reality_inbound(domain, tag=f"{p}VLESS_REALITY"))
     if kind in ("hy2", "both"):
-        inbounds.append(hysteria_inbound(domain, tag=f"{p}HYSTERIA2"))
+        inbounds.append(hysteria_inbound(tag=f"{p}HYSTERIA-BBR", bbr=bbr))
+    if kind in ("reality", "both"):
+        inbounds.append(reality_inbound(domains, tag=f"{p}VLESS-SELFSTEAL"))
     return {
-        "log": {"loglevel": "warning"},
+        "log": {"loglevel": "none"},
         "inbounds": inbounds,
         "outbounds": [
             {"tag": "DIRECT", "protocol": "freedom"},
@@ -103,6 +103,7 @@ def build_profile(kind: str, domain: str, prefix: str = "") -> dict:
         "routing": {
             "rules": [
                 {"ip": ["geoip:private"], "outboundTag": "BLOCK"},
+                {"domain": ["geosite:private"], "outboundTag": "BLOCK"},
                 {"protocol": ["bittorrent"], "outboundTag": "BLOCK"},
             ]
         },

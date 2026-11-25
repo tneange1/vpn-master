@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
-from .. import backup, config, db, terminal
+from .. import backup, config, db, selfupdate, terminal
 from ..ui import h, kb, say, show
 
 router = Router(name="common")
@@ -22,8 +22,8 @@ async def main_text() -> str:
 
 MAIN_KB = kb([("📦 Установка проектов", "inst")],
              [("🛠 Управление", "mng")],
-             [("🔐 Доступы и серверы", "acc")],
-             [("💾 Бэкап бота", "bk"), ("❓ Помощь", "help")])
+             [("🔐 Доступы и серверы", "acc"), ("🔑 SSH-ключи", "key:list")],
+             [("⚙️ Бот", "bot"), ("❓ Помощь", "help")])
 
 
 @router.message(CommandStart())
@@ -49,9 +49,13 @@ async def help_(c: CallbackQuery):
                   "• Модификации: Link Extractor, Backup-Restore (на панель, свой бот), WARP (на ноду)\n"
                   "• Безопасность: UFW, вход по паролю вкл/выкл, ключи, секретная ссылка панели\n"
                   "• Обновления: всё по отдельности\n\n"
-                  "<b>🔐 Доступы</b> — серверы, ключи, пароли, токены. Всё в PostgreSQL, секреты зашифрованы.\n\n"
-                  "<b>💾 Бэкап бота</b> — дамп БД + ключ шифрования одним архивом.\n\n"
-                  "Команды: /menu — меню, /cancel — отменить ввод, /term — закрыть терминал.",
+                  "<b>🔐 Доступы</b> — серверы, пароли, токены. <b>🔑 SSH-ключи</b> — загрузка из файла, "
+                  "раздача по серверам. Всё в PostgreSQL, секреты зашифрованы.\n\n"
+                  "<b>⚙️ Бот</b> — бэкап бота и автообновление из git.\n\n"
+                  "<b>💻 Терминал</b> — живая SSH-сессия на сервере прямо в чате: пишешь команду сообщением, "
+                  "бот отправляет её на сервер и показывает экран. Нужен для установщиков с вопросами "
+                  "(backup-restore, WARP) и ручной работы. Открыть: /term или Доступы → сервер → 💻 Терминал.\n\n"
+                  "Команды: /menu — меню, /cancel — отменить ввод, /term — открыть/закрыть терминал.",
                kb([("⬅️ Назад", "menu")]))
 
 
@@ -70,6 +74,77 @@ class Restore(StatesGroup):
 BACKUP_HOURS = ["0", "6", "12", "24", "72"]
 
 
+@router.callback_query(F.data == "bot")
+async def bot_menu(c: CallbackQuery):
+    st = selfupdate.status()
+    ver = f"<code>{h(st.get('commit', '?'))}</code> {h(st.get('subject', ''))}" if st else "updater не запущен"
+    await show(c, f"⚙️ <b>Бот</b>\nВерсия: {ver}",
+               kb([("💾 Бэкап бота", "bk"), ("🔄 Обновление", "su")], [("⬅️ Меню", "menu")]))
+
+
+RESULT = {"idle": "ещё не проверял", "uptodate": "✅ последняя версия", "available": "🆕 есть обновление",
+          "updating": "⏳ обновляется…", "updated": "✅ обновлён", "failed": "❌ сборка упала, откатился",
+          "error": "⚠️ ошибка"}
+
+
+@router.callback_query(F.data == "su")
+async def su_menu(c: CallbackQuery):
+    st = selfupdate.status()
+    minutes = int(await db.setting("autoupdate_interval", "60") or 0)
+    if not st:
+        text = ("🔄 <b>Автообновление бота</b>\n\n⚠️ Контейнер <code>vpn-master-updater</code> не отвечает.\n"
+                "Обнови один раз вручную на сервере, дальше бот будет обновляться сам:\n"
+                "<code>cd /opt/vpn-master && git pull && docker compose up -d --build</code>")
+    else:
+        checked = st.get("checked")
+        when = datetime.fromtimestamp(float(checked), timezone.utc).strftime("%d.%m %H:%M UTC") if checked else "—"
+        msg = st.get("message", "")
+        if st.get("result") == "available":
+            msg = "\n" + "\n".join("• " + x for x in msg.split(";") if x)
+        text = (f"🔄 <b>Автообновление бота</b> (git → пересборка)\n\n"
+                f"Версия: <code>{h(st.get('commit'))}</code> {h(st.get('subject', ''))}\n"
+                f"Проверка: {h(when)} — {RESULT.get(st.get('result'), h(st.get('result')))} {h(msg)}\n"
+                f"Ветка: <code>{h(await db.setting('autoupdate_branch', 'main'))}</code>")
+    rows = [[("🔍 Проверить", "su:check"), ("⬆️ Обновить сейчас", "su:now")],
+            [(("✅ " if minutes == m else "") + label, f"su:i:{m}") for label, m in selfupdate.INTERVALS],
+            [("📜 Лог", "su:log"), ("⬅️ Назад", "bot")]]
+    await show(c, text + f"\n\nАвтоматически: {'выкл' if not minutes else f'каждые {minutes} мин'}", kb(*rows))
+
+
+@router.callback_query(F.data.startswith("su:i:"))
+async def su_interval(c: CallbackQuery):
+    await db.set_setting("autoupdate_interval", c.data.split(":")[2])
+    await selfupdate.sync_files()
+    await su_menu(c)
+
+
+@router.callback_query(F.data.in_({"su:check", "su:now"}))
+async def su_go(c: CallbackQuery):
+    selfupdate.request("check" if c.data == "su:check" else "update")
+    await c.answer("Запрос отправлен updater-у — через ~20 сек обнови экран" +
+                   (". Если есть новое, бот перезапустится и напишет." if c.data == "su:now" else ""), show_alert=True)
+
+
+@router.callback_query(F.data == "su:log")
+async def su_log(c: CallbackQuery):
+    await say(c, f"<pre>{h(selfupdate.log_tail()[-3500:]) or 'лог пуст'}</pre>", kb([("⬅️ Назад", "su")]))
+
+
+async def notify_if_updated(bot: Bot) -> None:
+    await selfupdate.sync_files()
+    st = selfupdate.status()
+    commit = st.get("commit")
+    last = await db.setting("last_commit")
+    if commit and commit != last:
+        await db.set_setting("last_commit", commit)
+        if last:
+            try:
+                await bot.send_message(config.OWNER_ID, f"🔄 Бот обновлён: <code>{h(last)}</code> → "
+                                                        f"<code>{h(commit)}</code>\n{h(st.get('subject', ''))}")
+            except Exception:  # noqa: BLE001
+                pass
+
+
 @router.callback_query(F.data == "bk")
 async def bk_menu(c: CallbackQuery):
     hours = await db.setting("backup_hours", "24")
@@ -81,7 +156,7 @@ async def bk_menu(c: CallbackQuery):
                   f"Последний: {h(last or '—')}",
                kb([("💾 Сделать сейчас", "bk:now"), ("♻️ Восстановить", "bk:res")],
                   [(("✅ " if hours == x else "") + ("выкл" if x == "0" else f"{x}ч"), f"bk:h:{x}") for x in BACKUP_HOURS],
-                  [("⬅️ Назад", "menu")]))
+                  [("⬅️ Назад", "bot")]))
 
 
 async def send_backup(bot: Bot) -> None:
@@ -172,9 +247,17 @@ async def term_key(c: CallbackQuery):
 
 
 @router.message(Command("term"))
-async def term_close_cmd(m: Message):
-    await terminal.stop(m.from_user.id)
-    await m.answer("Терминал закрыт.")
+async def term_cmd(m: Message):
+    if terminal.active(m.from_user.id):
+        await terminal.stop(m.from_user.id)
+        return await m.answer("💻 Терминал закрыт.")
+    servers = await db.all_(db.Server)
+    if not servers:
+        return await m.answer("💻 Терминал — SSH-сессия на сервере прямо в чате. Сначала добавь сервер.",
+                              reply_markup=kb([("➕ Добавить сервер", "srv:add")]))
+    await m.answer("💻 <b>Терминал</b>\nЖивая SSH-сессия на сервере прямо в чате: пишешь команды сообщениями, "
+                   "бот показывает экран. Кнопки снизу — Enter, Ctrl+C, стрелки.\nНа какой сервер?",
+                   reply_markup=kb(*[[(f"💻 {s.name} · {s.host}", f"srv:term:{s.id}")] for s in servers]))
 
 
 @router.message(F.text, lambda m: terminal.active(m.from_user.id))

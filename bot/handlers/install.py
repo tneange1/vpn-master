@@ -11,6 +11,7 @@ from ..forms import Field, form, start_form
 from ..rw_api import RwError, for_panel
 from ..runner import run_task
 from ..ui import chat_id, h, kb, say, show
+from .panels import ensure_api_token
 from .servers import SERVER_FIELDS, ensure_server
 
 router = Router(name="install")
@@ -66,7 +67,7 @@ async def inst_rw_done(event, values, ctx):
             f"API-токен: {'сохранён ✅' if token else '❌ не получен — задай вручную'}\n\n"
             "Пароль и токен лежат в БД (🔐 Доступы → Панели).")
     await say(event, text, kb([("🖥 К панели", f"pn:v:{panel.id}")],
-                              [("🔑 Задать API-токен", f"pn:tok:{panel.id}")] if not token else [],
+                              [("🔑 Доступ к API", f"pn:api:{panel.id}")] if not token else [],
                               [("🏠 Меню", "menu")]))
 
 
@@ -79,7 +80,12 @@ async def inst_rw(c: CallbackQuery, state: FSMContext):
 @form("inst_rwx", "🔗 Подключить панель", [
     Field("name", "Название панели (для себя):"),
     Field("domain", "Домен панели:", "domain"),
-    Field("token", "API-токен (Панель → Настройки → API-токены). Сообщение удалю:", secret=True),
+    Field("auth", "Как бот будет ходить в API панели?", "choice",
+          choices=[("🔑 API-токен", "token"), ("👤 Логин и пароль админа", "cred"), ("Оба", "both")]),
+    Field("token", "API-токен (Панель → Настройки → API-токены). Сообщение удалю:", secret=True,
+          when=lambda v: v.get("auth") in ("token", "both")),
+    Field("user", "Логин админа панели:", when=lambda v: v.get("auth") in ("cred", "both")),
+    Field("pw", "Пароль админа (сообщение удалю):", secret=True, when=lambda v: v.get("auth") in ("cred", "both")),
     Field("sub", "Домен подписки (если есть):", "domain", optional=True),
 ] + SERVER_FIELDS)
 async def inst_rwx_done(event, values, ctx):
@@ -89,11 +95,11 @@ async def inst_rwx_done(event, values, ctx):
         return await say(event, f"❌ {h(e)}", kb([("🏠 Меню", "menu")]))
     panel = db.Panel(name=values["name"], server_id=server.id if server else None, domain=values["domain"],
                      sub_domain=values.get("sub"), api_url=f"https://{values['domain']}",
-                     api_token_enc=crypto.enc(values["token"]), managed_proxy=False)
+                     api_token_enc=crypto.enc(values.get("token")), admin_user=values.get("user"),
+                     admin_pass_enc=crypto.enc(values.get("pw")), managed_proxy=False)
     try:
-        rw = for_panel(panel)
-        nodes = await rw.nodes()
-        await rw.close()
+        async with for_panel(panel) as rw:
+            nodes = await rw.nodes()
         status = f"✅ API отвечает, нод в панели: {len(nodes)}"
     except RwError as e:
         status = f"⚠️ API не ответил: <code>{h(e)}</code>"
@@ -125,10 +131,11 @@ async def inst_bb_done(event, values, ctx):
     except RuntimeError as e:
         return await say(event, f"❌ {h(e)}", kb([("🏠 Меню", "menu")]))
     panel = await db.get(db.Panel, values["panel"])
-    rw_token = crypto.dec(panel.api_token_enc)
-    if not rw_token:
-        return await say(event, "❌ У панели нет API-токена. Задай его и повтори.",
-                         kb([("🔑 Задать токен", f"pn:tok:{panel.id}")]))
+    try:
+        rw_token = await ensure_api_token(panel)
+    except RwError as e:
+        return await say(event, f"❌ Нужен API-токен панели, а выпустить его не вышло: <code>{h(e)}</code>",
+                         kb([("🔑 Доступ к API", f"pn:api:{panel.id}")]))
     local = panel.server_id == server.id
     web_token = secrets.token_hex(32)
     script = scripts.bedolaga_install(

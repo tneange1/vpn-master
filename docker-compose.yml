@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: vpn-master-db
+    restart: always
+    environment:
+      POSTGRES_DB: vpnmaster
+      POSTGRES_USER: vpnmaster
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vpnmaster}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpnmaster -d vpnmaster"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  bot:
+    build: .
+    container_name: vpn-master
+    restart: always
+    env_file: .env
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vpnmaster}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:

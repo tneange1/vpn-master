@@ -100,7 +100,8 @@ async def inst_rw_done(event, values, ctx):
         panel.api_token_enc = crypto.enc(token)
     kind = await _pick_proxy(event, server, values.get("proxy"))
     pres = await run_task(event.bot, chat_id(event), server, f"{kind.capitalize()}: панель и подписка",
-                          proxy.apply_script(kind, "panel", proxy.panel_sites(panel, cookie), values.get("email") or None))
+                          proxy.apply_script(kind, proxy.sname("panel", panel.id), proxy.panel_sites(panel, cookie),
+                                             values.get("email") or None))
     if pres.ok and cookie:
         panel.protected, panel.cookie_enc = True, crypto.enc(cookie)
     panel = await db.save(panel)
@@ -213,15 +214,15 @@ async def rwx_go(c: CallbackQuery):
     if server.proxy and server.proxy != kind:
         kind = server.proxy
     cookie = new_cookie() if plan["protect"] else None
-    extra = []
-    if plan.get("hooks"):
-        extra.append(("bedolaga", proxy.bedolaga_sites(plan["hooks"])))
-    if plan.get("cabinet"):
-        extra.append(("cabinet", proxy.cabinet_sites(plan["cabinet"], "remnawave_bot:8080")))
+    groups = await proxy.server_groups(server, cookie_override={p.id: cookie})
+    domains = {x.domain for _, ss in groups for x in ss}
+    if plan.get("hooks") and plan["hooks"] not in domains:
+        groups.append((f"bedolaga-ext{p.id}", proxy.bedolaga_sites(plan["hooks"])))
+    if plan.get("cabinet") and plan["cabinet"] not in domains:
+        groups.append((f"cabinet-ext{p.id}", proxy.cabinet_sites(plan["cabinet"], "remnawave_bot:8080")))
     await c.answer()
     res = await run_task(c.bot, c.message.chat.id, server, f"Перенастройка прокси → {kind.capitalize()}",
-                         proxy.takeover_script(kind, proxy.panel_sites(p, cookie), extra, p.domain, cookie,
-                                               plan.get("email")))
+                         proxy.takeover_script(kind, groups, p.domain, cookie, plan.get("email")))
     if not res.ok:
         return await say(c, "❌ Не получилось — старый прокси возвращён. Лог выше.",
                          kb([("🔁 Ещё раз", f"rwx:go:{p.id}"), ("🖥 К панели", f"pn:v:{p.id}")]))
@@ -294,7 +295,7 @@ async def inst_bb_done(event, values, ctx):
         b = await db.save(b)
     kind = await _pick_proxy(event, server, values.get("proxy"))
     pres = await run_task(event.bot, chat_id(event), server, f"{kind.capitalize()}: {b.hooks_domain}",
-                          proxy.apply_script(kind, "bedolaga", proxy.bedolaga_sites(b.hooks_domain)))
+                          proxy.apply_script(kind, proxy.sname("bedolaga", b.id), proxy.bedolaga_sites(b.hooks_domain)))
     await say(event, f"{'✅' if res.ok and pres.ok else '⚠️'} Bedolaga <b>{h(b.name)}</b>\n"
                      f"Вебхуки и API: https://{h(b.hooks_domain)}\n"
                      f"Сервер: {h(server.name)} ({'рядом с панелью, docker-compose.local' if local else 'отдельный'})\n"
@@ -342,7 +343,7 @@ async def inst_cab_done(event, values, ctx):
     kind = await _pick_proxy(event, cab_srv, values.get("proxy"))
     api = "remnawave_bot:8080" if same else f"https://{b.hooks_domain}"
     r3 = await run_task(event.bot, chat_id(event), cab_srv, f"{kind.capitalize()}: {domain}",
-                        proxy.apply_script(kind, "cabinet", proxy.cabinet_sites(domain, api)))
+                        proxy.apply_script(kind, proxy.sname("cabinet", b.id), proxy.cabinet_sites(domain, api)))
     ok = r1.ok and r2.ok and r3.ok
     if r2.ok:
         b.cabinet, b.cabinet_domain = True, domain

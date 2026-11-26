@@ -176,6 +176,17 @@ VMEOF
 VMEOF
   chmod 644 /etc/cron.d/vpn-master-nginx-certs
 }
+nginx_cert(){ # имя "домены" — сертификат certbot webroot (nginx должен работать)
+  local name="$1" domains="$2" args="" d mail
+  certbot_compose
+  for d in $domains; do args="$args -d $d"; done
+  log "Сертификат $name: $domains"
+  if [ -n "${VM_EMAIL:-}" ]; then mail="--email $VM_EMAIL"; else mail="--register-unsafely-without-email"; fi
+  # shellcheck disable=SC2086
+  (cd CERTBOTDIR && docker compose run --rm -T certbot certonly --webroot -w /var/www/certbot \
+     --non-interactive --agree-tos $mail --cert-name "$name" --expand $args </dev/null) || { echo "!! certbot не выдал сертификат для $domains"; return 4; }
+}
+vm_rm_site(){ rm -f "CADDYDIR/sites/$1.caddy" "NGINXDIR/conf.d/$1.conf"; }
 nginx_site(){ # имя "домены через пробел"; содержимое — stdin
   local name="$1" domains="$2" content args="" d
   content=$(cat)
@@ -183,13 +194,7 @@ nginx_site(){ # имя "домены через пробел"; содержим�
     echo "!! На сервере работает Nginx, который ставил не vpn-master. Добавь блок вручную:"; echo "$content"; return 3
   fi
   if ! (nginx_ours && running nginx); then nginx_setup || return $?; fi
-  certbot_compose
-  for d in $domains; do args="$args -d $d"; done
-  log "Сертификат $name: $domains"
-  if [ -n "${VM_EMAIL:-}" ]; then mail="--email $VM_EMAIL"; else mail="--register-unsafely-without-email"; fi
-  # shellcheck disable=SC2086
-  (cd CERTBOTDIR && docker compose run --rm -T certbot certonly --webroot -w /var/www/certbot \
-     --non-interactive --agree-tos $mail --cert-name "$name" --expand $args </dev/null) || { echo "!! certbot не выдал сертификат"; return 4; }
+  nginx_cert "$name" "$domains" || return 4
   printf '%s\n' "$content" > "NGINXDIR/conf.d/$name.conf"
   proxy_networks nginx
   if ! docker exec nginx nginx -t; then
@@ -458,8 +463,9 @@ def bedolaga_install(*, bot_token: str, admin_ids: str, hooks_domain: str, rw_ur
         "REMNAWAVE_API_URL": rw_url, "REMNAWAVE_API_KEY": rw_key, "REMNAWAVE_AUTH_TYPE": "api_key",
         "POSTGRES_DB": "remnawave_bot", "POSTGRES_USER": "remnawave_user", "POSTGRES_PASSWORD": pg_pass,
     }
-    if rw_cookie:  # секретный путь панели: бот шлёт его в X-Api-Key
-        env["REMNAWAVE_CADDY_TOKEN"] = rw_cookie
+    if rw_cookie:  # секретный путь панели: AUTH_TYPE=caddy → X-Api-Key = CADDY_TOKEN, плюс cookie
+        env.update({"REMNAWAVE_AUTH_TYPE": "caddy", "REMNAWAVE_CADDY_TOKEN": rw_cookie,
+                    "REMNAWAVE_SECRET_KEY": f"vmkey:{rw_cookie}"})
     sets = "\n".join(f"set_env .env {k} {q(v)}" for k, v in env.items())
     return _script(f"""
 need_docker

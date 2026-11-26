@@ -25,8 +25,11 @@ def conf_of(mod: db.Mod | None, panel: db.Panel) -> dict:
     except (ValueError, TypeError):
         return {}
     token = data.get("token") or data.get("apiToken")
-    url = data.get("url") or default_url(panel)
-    return {"url": url.rstrip("/"), "token": token} if token else {}
+    url = (data.get("url") or default_url(panel)).rstrip("/")
+    # экстрактор работает с домена подписки, а не панели
+    if panel.sub_domain and panel.sub_local and url.split("/")[2:3] == [panel.domain]:
+        url = default_url(panel)
+    return {"url": url, "token": token} if token else {}
 
 
 def default_url(panel: db.Panel) -> str:

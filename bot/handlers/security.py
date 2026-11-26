@@ -305,7 +305,7 @@ async def sec_panel_toggle(c: CallbackQuery, bot: Bot):
     cookie = secrets.token_urlsafe(24).replace("-", "x").replace("_", "y") if on else None
     await c.answer()
     res = await run_task(bot, c.message.chat.id, server, f"Защита панели {'ВКЛ' if on else 'ВЫКЛ'}",
-                         proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, cookie)))
+                         proxy.apply_script(proxy.kind_of(server), proxy.sname("panel", p.id), proxy.panel_sites(p, cookie)))
     if res.ok:
         p.protected, p.cookie_enc = on, crypto.enc(cookie) if cookie else None
         p = await db.save(p)

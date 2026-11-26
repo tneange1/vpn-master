@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
-from .. import crypto, db, scripts, ssh
+from .. import crypto, db, proxy, scripts, ssh
 from ..forms import Field, form, start_form
 from ..runner import run_task
 from ..ui import chat_id, h, kb, say, show
@@ -25,7 +25,7 @@ async def sec_menu(c: CallbackQuery):
     rows += [[(f"🔒 Защита панели {p.name}", f"sec:p:{p.id}")] for p in panels]
     rows.append([("⬅️ Назад", "mng")])
     await show(c, "🛡 <b>Безопасность</b>\n\nСервер: UFW, IPv6, ping, SSH-порт, вход по паролю, root.\n"
-                  "Панель: секретная ссылка в Caddy (docs.rw/install/panel-security).", kb(*rows))
+                  "Панель: секретный путь в Caddy/Nginx (docs.rw/install/panel-security).", kb(*rows))
 
 
 async def _srv(c: CallbackQuery, idx: int = 2) -> db.Server | None:
@@ -42,16 +42,27 @@ async def sec_server(c: CallbackQuery):
     i = s.id
     await show(c, f"🛡 <b>{h(s.name)}</b> · <code>{h(s.host)}:{s.port}</code>\n"
                   f"Бот входит: {'🔑 по ключу' if s.auth == 'key' else '🔒 по паролю'}",
-               kb([("🧱 UFW", f"ufw:m:{i}"), ("🔐 SSH", f"ssh:m:{i}")],
+               kb([("🧱 Firewall (UFW)", f"ufw:m:{i}"), ("🔐 SSH", f"ssh:m:{i}")],
+                  [("🚀 BBR: включить", f"bbr:{i}:1"), ("выключить", f"bbr:{i}:0"), ("статус", f"bbr:{i}:s")],
                   [("📊 Статус всего", f"sec:st:{i}")],
                   [("⬅️ Безопасность", "sec"), ("🖥 Сервер", f"srv:v:{i}")]))
+
+
+@router.callback_query(F.data.startswith("bbr:"))
+async def bbr_toggle(c: CallbackQuery, bot: Bot):
+    _, i, mode = c.data.split(":")
+    s = await db.get(db.Server, i)
+    script = scripts.BBR_STATUS if mode == "s" else scripts.bbr(mode == "1")
+    await c.answer()
+    await run_task(bot, c.message.chat.id, s, "BBR " + {"1": "вкл", "0": "выкл", "s": "статус"}[mode], script)
 
 
 @router.callback_query(F.data.startswith("sec:st:"))
 async def sec_status(c: CallbackQuery, bot: Bot):
     if s := await _srv(c):
         await c.answer()
-        await run_task(bot, c.message.chat.id, s, "Статус безопасности", scripts.UFW_STATUS + scripts.SSH_STATUS)
+        await run_task(bot, c.message.chat.id, s, "Статус безопасности",
+                       scripts.UFW_STATUS + scripts.SSH_STATUS.split("\n", 1)[1] + scripts.BBR_STATUS.split("\n", 1)[1])
 
 
 # ------------------------------------------------------------------ UFW
@@ -270,11 +281,12 @@ async def sec_panel(c: CallbackQuery):
     p = await db.get(db.Panel, c.data.split(":")[2])
     i = p.id
     if not p.managed_proxy:
-        return await show(c, "🔒 Эта панель подключена, а не установлена ботом — её Caddy я не трогаю.\n"
-                             "Гайды: https://docs.rw/install/panel-security/", kb([("⬅️ Назад", "sec")]))
+        return await show(c, "🔒 Reverse proxy этой панели ставил не бот — его я не трогаю.\n"
+                             "Чтобы бот взял прокси под себя: Установка → 🔗 Подключить панель → «настроить прокси» "
+                             "(старый прокси будет забэкаплен, при ошибке — откат).", kb([("⬅️ Назад", "sec")]))
     status = "🔒 включена" if p.protected else "выключена"
     text = (f"🔒 <b>Защита панели {h(p.name)}</b>: {status}\n\n"
-            "Caddy пускает в панель только с cookie. Cookie выдаётся по секретной ссылке "
+            f"{proxy.KINDS.get(proxy.kind_of(await db.get(db.Server, p.server_id)), '')} пускает в панель только с cookie. Cookie выдаётся по секретной ссылке "
             "<code>https://панель/?vmkey=…</code>; без неё соединение сбрасывается. Страница подписки "
             "на своём домене остаётся открытой.")
     if p.protected:
@@ -293,7 +305,7 @@ async def sec_panel_toggle(c: CallbackQuery, bot: Bot):
     cookie = secrets.token_urlsafe(24).replace("-", "x").replace("_", "y") if on else None
     await c.answer()
     res = await run_task(bot, c.message.chat.id, server, f"Защита панели {'ВКЛ' if on else 'ВЫКЛ'}",
-                         scripts.apply_panel_site(p.domain, p.sub_domain, cookie, p.link_extractor))
+                         proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, cookie)))
     if res.ok:
         p.protected, p.cookie_enc = on, crypto.enc(cookie) if cookie else None
         await db.save(p)

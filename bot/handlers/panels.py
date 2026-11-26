@@ -56,7 +56,8 @@ async def panel_view(c: CallbackQuery):
             f"Подписка: {('https://' + h(p.sub_domain)) if p.sub_domain else '—'}\n"
             f"Сервер (SSH): {h(server.name + ' · ' + server.host) if server else '— не привязан'}\n"
             f"Доступ к API: {_api_label(p)}\n"
-            f"Caddy от vpn-master: {'✅' if p.managed_proxy else '—'} · Защита ссылкой: {'🔒' if p.protected else 'выкл'}\n"
+            f"Прокси: {(server.proxy or 'caddy').capitalize() + ' от vpn-master' if p.managed_proxy and server else 'не наш'}"
+            f" · Секретный путь: {'🔒' if p.protected else 'выкл'}\n"
             f"Нод в боте: {len(nodes)}")
     await show(c, text, kb(
         [("🛰 Ноды", f"pn:nodes:{i}"), ("🌐 Хосты", f"hs:list:{i}:0")],
@@ -105,7 +106,7 @@ async def pn_tok_done(event, values, ctx):
     p.api_token_enc = crypto.enc(values["token"])
     p = await db.save(p)
     server = await db.get(db.Server, p.server_id)
-    if server and p.managed_proxy:
+    if server and p.managed_proxy and p.sub_local:
         await run_task(event.bot, chat_id(event), server, "Токен для страницы подписки",
                        scripts.set_subpage_token(values["token"]))
     await say(event, await _test(p), kb([("⬅️ Доступ к API", f"pn:api:{p.id}")]))
@@ -710,9 +711,37 @@ async def prof_list(c: CallbackQuery):
         tags = ", ".join(i.get("tag", "?") for i in pr.get("inbounds") or [])
         lines.append(f"• <b>{h(pr['name'])}</b>: {h(tags) or '—'}")
         rows.append([(f"📄 {pr['name']}", f"pf:dl:{p.id}:{pr['uuid']}")])
-    rows.append([("✨ Создать профиль", f"pf:new:{p.id}")])
+    rows.append([("✨ Создать из шаблона", f"pf:new:{p.id}"), ("📥 Загрузить JSON", f"pf:up:{p.id}")])
     rows.append([("⬅️ К панели", f"pn:v:{p.id}")])
-    await show(c, "\n".join(lines) + "\n\n📄 — скачать JSON профиля", kb(*rows))
+    await show(c, "\n".join(lines) + "\n\n📄 — скачать JSON профиля\n"
+                  "Шаблоны: VLESS Reality self-steal и Hysteria2 по мануалу.", kb(*rows))
+
+
+@form("pf_up", "📥 Загрузить профиль", [
+    Field("json", "Пришли JSON профиля Xray <b>файлом</b> или текстом (как в редакторе профиля панели):", "raw"),
+    Field("name", "Название профиля:", optional=True, default=""),
+])
+async def pf_up_done(event, values, ctx):
+    p = await db.get(db.Panel, ctx["panel"])
+    try:
+        cfg = json.loads(values["json"])
+        if not isinstance(cfg, dict) or "inbounds" not in cfg:
+            raise ValueError("нет поля inbounds")
+    except ValueError as e:
+        return await say(event, f"❌ Это не JSON профиля: <code>{h(e)}</code>", kb([("⬅️ Профили", f"pn:prof:{p.id}")]))
+    name = values.get("name") or (values.get("_filename") or "profile").removesuffix(".json")
+    try:
+        async with for_panel(p) as rw:
+            pr = await rw.create_profile(name, cfg)
+    except RwError as e:
+        return await say(event, f"❌ <code>{h(e)}</code>", kb([("⬅️ Профили", f"pn:prof:{p.id}")]))
+    await say(event, f"✅ Профиль <b>{h(pr.get('name', name))}</b> загружен, инбаундов: {len(pr.get('inbounds') or [])}.",
+              kb([("⬅️ Профили", f"pn:prof:{p.id}")]))
+
+
+@router.callback_query(F.data.startswith("pf:up:"))
+async def pf_up(c: CallbackQuery, state: FSMContext):
+    await start_form(c, state, "pf_up", ctx={"panel": int(c.data.split(":")[2])})
 
 
 @router.callback_query(F.data.startswith("pf:dl:"))

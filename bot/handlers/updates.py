@@ -8,7 +8,7 @@ from ..ui import h, kb, say, show
 
 router = Router(name="updates")
 
-LABEL = {"panel": "Панель Remnawave", "subpage": "Страница подписки", "caddy": "Caddy",
+LABEL = {"panel": "Панель Remnawave", "subpage": "Страница подписки", "caddy": "Caddy", "nginx": "Nginx",
          "node": "Нода", "selfsteal": "Self-steal Nginx", "bedolaga": "Bedolaga Bot",
          "cabinet": "Bedolaga Cabinet", "link_extractor": "Link Extractor", "backup_restore": "rw-backup"}
 
@@ -32,7 +32,9 @@ async def upd_panel(c: CallbackQuery):
     if s:
         rows += [[("🌊 Панель", f"upd:run:panel:{s}"), ("📄 Подписка", f"upd:run:subpage:{s}")]]
         if p.managed_proxy:
-            rows += [[("🧭 Caddy", f"upd:run:caddy:{s}")]]
+            srv = await db.get(db.Server, s)
+            kind = srv.proxy if srv and srv.proxy else "caddy"
+            rows += [[(f"🧭 {kind.capitalize()}", f"upd:run:{kind}:{s}")]]
         if p.link_extractor:
             rows += [[("🔗 Link Extractor", f"upd:run:link_extractor:{s}")]]
     rows += [[(f"🛰 Нода {n.name}", f"upd:run:node:{n.id}"), ("nginx self-steal", f"upd:run:selfsteal:{n.id}")] for n in nodes]
@@ -59,8 +61,11 @@ async def _target(kind: str, obj_id: str):
         return await db.get(db.Server, n.server_id), scripts.UPDATES[kind], f"{LABEL[kind]} {n.name}"
     if kind in ("bedolaga", "cabinet"):
         b = await db.get(db.Bedolaga, obj_id)
+        srv_id = b.server_id
+        if kind == "cabinet":
+            srv_id = await db.setting(f"cabinet_srv:{b.id}") or b.server_id
         script = scripts.bedolaga_update(b.compose_file) if kind == "bedolaga" else scripts.UPDATES["cabinet"]
-        return await db.get(db.Server, b.server_id), script, f"{LABEL[kind]} {b.name}"
+        return await db.get(db.Server, srv_id), script, f"{LABEL[kind]} {b.name}"
     s = await db.get(db.Server, obj_id)  # panel/subpage/caddy/link_extractor/backup_restore — по id сервера
     return s, scripts.UPDATES[kind], LABEL[kind]
 

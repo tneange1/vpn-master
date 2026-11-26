@@ -5,6 +5,8 @@ BEDOLAGA_DIR = "/opt/remnawave-bedolaga-telegram-bot"
 BEDOLAGA_NET = "remnawave-bedolaga-telegram-bot_bot_network"
 CABINET_DIR = "/opt/bedolaga-cabinet"
 CADDY_DIR = "/opt/remnawave/caddy"
+NGINX_DIR = "/opt/remnawave/nginx"
+CERTBOT_DIR = "/opt/certbot"
 
 PRELUDE = r"""#!/usr/bin/env bash
 set -eo pipefail
@@ -25,15 +27,42 @@ set_env(){ # файл ключ значение
 }
 get_env(){ grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//'; }
 
-# ---- общий Caddy (reverse proxy) в /opt/remnawave/caddy, сайты в sites/*.caddy
+# ---- reverse proxy: Caddy (/opt/remnawave/caddy) или Nginx (/opt/remnawave/nginx), сайты — отдельными файлами
+# Что перенесли/остановили — пишем в /tmp/vm_moved, чтобы уметь откатиться.
+proxy_networks(){ # контейнер прокси
+  for n in remnawave-network BEDOLAGANET; do
+    if docker network inspect "$n" >/dev/null 2>&1; then docker network connect "$n" "$1" 2>/dev/null || true; fi
+  done
+}
+running(){ docker ps --format '{{.Names}}' | grep -qx "$1"; }
+move_foreign(){ # каталог
+  local d="$1" bak
+  bak="$d.bak.$(date +%s)"
+  log "Нашёл чужой $d — останавливаю и переношу в $bak"
+  (cd "$d" && docker compose down 2>/dev/null) || true
+  mv "$d" "$bak"; echo "$d|$bak" >> /tmp/vm_moved
+}
+certbot_compose(){
+  mkdir -p CERTBOTDIR/certs CERTBOTDIR/var-lib-letsencrypt CERTBOTDIR/logs CERTBOTDIR/www
+  cat > CERTBOTDIR/docker-compose.yml <<'VMEOF'
+services:
+  certbot:
+    container_name: certbot
+    image: certbot/certbot
+    network_mode: host
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./var-lib-letsencrypt:/var/lib/letsencrypt
+      - ./logs:/var/log/letsencrypt
+      - ./www:/var/www/certbot
+VMEOF
+}
+
 caddy_ours(){ [ -f CADDYDIR/.vpn-master ]; }
 caddy_setup(){
   need_docker
-  if [ -d CADDYDIR ] && ! caddy_ours; then
-    log "Нашёл чужой CADDYDIR — переношу в CADDYDIR.bak.$(date +%s)"
-    (cd CADDYDIR && docker compose down 2>/dev/null) || true
-    mv CADDYDIR "CADDYDIR.bak.$(date +%s)"
-  fi
+  if [ -d CADDYDIR ] && ! caddy_ours; then move_foreign CADDYDIR; fi
+  if running nginx && [ -f NGINXDIR/.vpn-master ]; then echo "!! На сервере уже стоит Nginx от vpn-master — Caddy не ставлю"; return 5; fi
   mkdir -p CADDYDIR/sites && cd CADDYDIR && touch .vpn-master
   [ -f sites/_default.caddy ] || echo "# vpn-master" > sites/_default.caddy
   cat > Caddyfile <<'VMEOF'
@@ -73,24 +102,95 @@ volumes:
 VMEOF
   docker compose up -d
 }
-caddy_networks(){
-  for n in BEDOLAGANET; do
-    if docker network inspect "$n" >/dev/null 2>&1; then docker network connect "$n" caddy 2>/dev/null || true; fi
-  done
-}
-caddy_site(){ # имя сайта; содержимое — stdin
+caddy_networks(){ proxy_networks caddy; }
+caddy_site(){ # имя; содержимое — stdin
   local content; content=$(cat)
-  if docker ps --format '{{.Names}}' | grep -qx caddy && ! caddy_ours; then
+  if running caddy && ! caddy_ours; then
     echo "!! На сервере работает Caddy, который ставил не vpn-master. Добавь блок вручную:"; echo "$content"; return 3
   fi
-  caddy_ours && docker ps --format '{{.Names}}' | grep -qx caddy || caddy_setup
+  if ! (caddy_ours && running caddy); then caddy_setup || return $?; fi
   printf '%s\n' "$content" > "CADDYDIR/sites/$1.caddy"
   caddy_networks
-  docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+  if ! docker exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null; then
+    rm -f "CADDYDIR/sites/$1.caddy"; echo "!! Конфиг Caddy не прошёл проверку — сайт $1 не применён"; return 1
+  fi
   docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
   log "Caddy: сайт $1 применён"
 }
-""".replace("CADDYDIR", CADDY_DIR).replace("BEDOLAGANET", BEDOLAGA_NET)
+
+nginx_ours(){ [ -f NGINXDIR/.vpn-master ]; }
+nginx_setup(){
+  need_docker
+  if [ -d NGINXDIR ] && ! nginx_ours; then move_foreign NGINXDIR; fi
+  if running caddy && caddy_ours; then echo "!! На сервере уже стоит Caddy от vpn-master — Nginx не ставлю"; return 5; fi
+  mkdir -p NGINXDIR/conf.d && cd NGINXDIR && touch .vpn-master
+  certbot_compose
+  cat > conf.d/00-default.conf <<'VMEOF'
+map $http_upgrade $vm_conn { default upgrade; '' close; }
+server {
+    listen 80 default_server;
+    server_name _;
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://$host$request_uri; }
+}
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+VMEOF
+  docker network inspect remnawave-network >/dev/null 2>&1 || docker network create remnawave-network >/dev/null
+  cat > docker-compose.yml <<'VMEOF'
+services:
+  nginx:
+    image: nginx:stable-alpine
+    container_name: nginx
+    hostname: nginx
+    restart: always
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    networks:
+      - remnawave-network
+    volumes:
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - CERTBOTDIR/certs:/etc/letsencrypt:ro
+      - CERTBOTDIR/www:/var/www/certbot:ro
+networks:
+  remnawave-network:
+    name: remnawave-network
+    external: true
+VMEOF
+  docker compose up -d
+  cat > /etc/cron.d/vpn-master-nginx-certs <<'VMEOF'
+0 3 * * 1 root cd CERTBOTDIR && docker compose run --rm certbot renew --webroot -w /var/www/certbot >> /var/log/vpn-master-certbot.log 2>&1 && docker exec nginx nginx -s reload
+VMEOF
+  chmod 644 /etc/cron.d/vpn-master-nginx-certs
+}
+nginx_site(){ # имя "домены через пробел"; содержимое — stdin
+  local name="$1" domains="$2" content args="" d
+  content=$(cat)
+  if running nginx && ! nginx_ours; then
+    echo "!! На сервере работает Nginx, который ставил не vpn-master. Добавь блок вручную:"; echo "$content"; return 3
+  fi
+  if ! (nginx_ours && running nginx); then nginx_setup || return $?; fi
+  certbot_compose
+  for d in $domains; do args="$args -d $d"; done
+  log "Сертификат $name: $domains"
+  if [ -n "${VM_EMAIL:-}" ]; then mail="--email $VM_EMAIL"; else mail="--register-unsafely-without-email"; fi
+  # shellcheck disable=SC2086
+  (cd CERTBOTDIR && docker compose run --rm certbot certonly --webroot -w /var/www/certbot \
+     --non-interactive --agree-tos $mail --cert-name "$name" --expand $args) || { echo "!! certbot не выдал сертификат"; return 4; }
+  printf '%s\n' "$content" > "NGINXDIR/conf.d/$name.conf"
+  proxy_networks nginx
+  if ! docker exec nginx nginx -t; then
+    rm -f "NGINXDIR/conf.d/$name.conf"; echo "!! Конфиг Nginx не прошёл проверку — сайт $name не применён"; return 1
+  fi
+  docker exec nginx nginx -s reload
+  log "Nginx: сайт $name применён"
+}
+""".replace("CADDYDIR", CADDY_DIR).replace("NGINXDIR", NGINX_DIR).replace("CERTBOTDIR", CERTBOT_DIR) \
+    .replace("BEDOLAGANET", BEDOLAGA_NET)
 
 
 def _script(body: str) -> str:
@@ -103,30 +203,6 @@ def _heredoc_site(name: str, content: str) -> str:
 
 def _compose_restart(path: str) -> str:
     return f"cd {q(path)} && docker compose pull && docker compose down && docker compose up -d && docker compose ps"
-
-
-# ===================================================================== Caddy-сайты
-def panel_site(domain: str, sub_domain: str | None, cookie: str | None, link_extractor: bool) -> str:
-    # route{} — директивы выполняются строго по порядку (без авто-сортировки Caddy)
-    inner = []
-    if cookie:
-        inner += [f"@vmset query vmkey={cookie}",
-                  f'header @vmset Set-Cookie "vmkey={cookie}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000"',
-                  "redir @vmset / 302",
-                  f"@vmdeny not header Cookie *vmkey={cookie}*",
-                  "abort @vmdeny"]
-    if link_extractor:
-        inner.append("reverse_proxy /link-extractor/* link-extractor:3020")
-    inner.append("reverse_proxy remnawave:3000")
-    out = f"https://{domain} {{\n\troute {{\n" + "".join(f"\t\t{x}\n" for x in inner) + "\t}\n}\n"
-    if sub_domain:
-        upstream = "link-extractor:3020" if link_extractor else "remnawave-subscription-page:3010"
-        out += f"\nhttps://{sub_domain} {{\n\treverse_proxy {upstream}\n}}\n"
-    return out
-
-
-def apply_panel_site(domain, sub_domain, cookie, link_extractor) -> str:
-    return _script(_heredoc_site("panel", panel_site(domain, sub_domain, cookie, link_extractor)))
 
 
 # ===================================================================== Remnawave
@@ -197,8 +273,7 @@ set_env .env REMNAWAVE_PANEL_URL http://remnawave:3000
 if [ -n "$TOK" ]; then set_env .env REMNAWAVE_API_TOKEN "$TOK"; fi
 docker compose up -d
 
-log "Настраиваю Caddy"
-""" + _heredoc_site("panel", panel_site(domain, sub_domain, None, False)) + """
+""" + """
 log "Готово. Проверь DNS: A-записи доменов должны смотреть на этот сервер."
 docker ps --format 'table {{.Names}}\\t{{.Status}}'
 """)
@@ -213,7 +288,6 @@ docker compose up -d
 
 
 # ===================================================================== Нода (self-steal по мануалу)
-CERTBOT_DIR = "/opt/certbot"
 NGINX_SS_DIR = "/opt/nginx-selfsteal"
 
 SELFSTEAL_HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Сайт в разработке</title>
@@ -245,18 +319,7 @@ def _certbot_issue(domains: list[str], email: str | None, expand: bool = False) 
     mail = f"--email {q(email)}" if email else "--register-unsafely-without-email"
     return f"""
 log "Выпускаю сертификат (cert-name key): {' '.join(domains)}"
-mkdir -p {CERTBOT_DIR}/certs {CERTBOT_DIR}/var-lib-letsencrypt {CERTBOT_DIR}/logs && cd {CERTBOT_DIR}
-cat > docker-compose.yml <<'VMEOF'
-services:
-  certbot:
-    container_name: certbot
-    image: certbot/certbot
-    network_mode: host
-    volumes:
-      - ./certs:/etc/letsencrypt
-      - ./var-lib-letsencrypt:/var/lib/letsencrypt
-      - ./logs:/var/log/letsencrypt
-VMEOF
+certbot_compose && cd {CERTBOT_DIR}
 if ss -ltnH 2>/dev/null | awk '{{print $4}}' | grep -qE '(^|:)80$'; then
   echo "!! Порт 80 занят — certbot --standalone не сможет пройти проверку:"; ss -ltnp | grep -E ':80\\b' || true; exit 4
 fi
@@ -389,7 +452,6 @@ def bedolaga_install(*, bot_token: str, admin_ids: str, hooks_domain: str, rw_ur
     if rw_cookie:
         env["REMNAWAVE_SECRET_KEY"] = f"vmkey:{rw_cookie}"
     sets = "\n".join(f"set_env .env {k} {q(v)}" for k, v in env.items())
-    site = f"https://{hooks_domain} {{\n\treverse_proxy remnawave_bot:8080\n}}"
     return _script(f"""
 need_docker
 pkg git
@@ -403,32 +465,31 @@ F={compose}; [ -f "$F" ] || F=docker-compose.yml
 mark BEDOLAGA_COMPOSE "$F"
 log "Собираю и запускаю бота ($F)"
 docker compose -f "$F" up -d --build
-""" + _heredoc_site("bedolaga", site) + """
 sleep 5; docker ps --format 'table {{.Names}}\\t{{.Status}}'
 """)
 
 
-def cabinet_install(*, compose_file: str, cabinet_domain: str, hooks_domain: str | None) -> str:
+def cabinet_bot_env(*, compose_file: str, cabinet_domain: str, hooks_domain: str | None) -> str:
+    """На сервере бота: включить кабинет в .env Bedolaga и перезапустить бота."""
     origins = f"https://{cabinet_domain}" + (f",https://{hooks_domain}" if hooks_domain else "")
-    site = f"""https://{cabinet_domain} {{
-	encode gzip zstd
-	handle /api/* {{
-		uri strip_prefix /api
-		reverse_proxy remnawave_bot:8080
-	}}
-	handle {{
-		reverse_proxy cabinet_frontend:80
-	}}
-}}"""
     return _script(f"""
-need_docker
 cd {BEDOLAGA_DIR} || {{ echo "Bedolaga не найден в {BEDOLAGA_DIR}"; exit 2; }}
 set_env .env CABINET_ENABLED true
 [ -n "$(get_env .env CABINET_JWT_SECRET)" ] || set_env .env CABINET_JWT_SECRET "$(openssl rand -hex 32)"
 set_env .env CABINET_ALLOWED_ORIGINS {q(f"https://{cabinet_domain}")}
 set_env .env WEB_API_ALLOWED_ORIGINS {q(origins)}
 docker compose -f {q(compose_file)} up -d
-mkdir -p {CABINET_DIR} && cd {CABINET_DIR}
+log "Кабинет включён в .env бота"
+""")
+
+
+def cabinet_front(*, local: bool) -> str:
+    """Фронтенд кабинета. local — в сети бота; иначе в remnawave-network на отдельном сервере."""
+    net = BEDOLAGA_NET if local else "remnawave-network"
+    pre = "" if local else "docker network inspect remnawave-network >/dev/null 2>&1 || docker network create remnawave-network >/dev/null\n"
+    return _script(f"""
+need_docker
+{pre}mkdir -p {CABINET_DIR} && cd {CABINET_DIR}
 cat > docker-compose.yml <<'VMEOF'
 services:
   cabinet-frontend:
@@ -440,11 +501,10 @@ services:
 networks:
   bot_network:
     external: true
-    name: {BEDOLAGA_NET}
+    name: {net}
 VMEOF
 docker compose pull && docker compose up -d
-""" + _heredoc_site("cabinet", site) + """
-docker ps --format 'table {{.Names}}\\t{{.Status}}'
+docker ps --format 'table {{{{.Names}}}}\\t{{{{.Status}}}}' | grep -i cabinet || true
 """)
 
 
@@ -666,6 +726,66 @@ echo "sshd слушает:"; ss -ltnp 2>/dev/null | grep -E 'sshd|systemd' | awk
 """)
 
 
+BBR_CONF = """net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_notsent_lowat = 16384
+net.core.netdev_max_backlog = 250000
+net.core.somaxconn = 8192
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384"""
+
+BBR_STATUS = _script("""
+echo "congestion: $(sysctl -n net.ipv4.tcp_congestion_control) (доступно: $(sysctl -n net.ipv4.tcp_available_congestion_control))"
+echo "qdisc: $(sysctl -n net.core.default_qdisc)"
+echo "ядро: $(uname -r)"
+[ -f /etc/sysctl.d/99-vpn-master-bbr.conf ] && echo "профиль vpn-master: включён" || echo "профиль vpn-master: нет"
+""")
+
+
+def bbr(enabled: bool) -> str:
+    if enabled:
+        return _script(f"""
+modprobe tcp_bbr 2>/dev/null || true
+grep -qx tcp_bbr /etc/modules-load.d/vpn-master-bbr.conf 2>/dev/null || echo tcp_bbr > /etc/modules-load.d/vpn-master-bbr.conf
+cat > /etc/sysctl.d/99-vpn-master-bbr.conf <<'VMEOF'
+{BBR_CONF}
+VMEOF
+sysctl -p /etc/sysctl.d/99-vpn-master-bbr.conf
+""") + BBR_STATUS.split("\n", 1)[1]
+    return _script("""
+rm -f /etc/sysctl.d/99-vpn-master-bbr.conf /etc/modules-load.d/vpn-master-bbr.conf
+sysctl -w net.ipv4.tcp_congestion_control=cubic net.core.default_qdisc=fq_codel
+""") + BBR_STATUS.split("\n", 1)[1]
+
+
+SERVER_STATE = _script("""
+echo "$(hostname) · $(. /etc/os-release && echo $PRETTY_NAME) · ядро $(uname -r)"
+echo "uptime: $(uptime -p 2>/dev/null || uptime)"
+echo "load: $(cut -d' ' -f1-3 /proc/loadavg) · CPU: $(nproc)"
+free -h | awk 'NR<=2'
+df -h / | awk 'NR<=2'
+echo; echo "IP: $(curl -s4 --max-time 5 https://ifconfig.me || echo ?)"
+echo; command -v docker >/dev/null && docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' || echo "docker не установлен"
+""")
+SERVER_REBOOT = _script("""
+echo "Перезагружаюсь через 3 секунды…"
+nohup sh -c 'sleep 3; reboot' >/dev/null 2>&1 &
+""")
+DOCKER_PRUNE = _script("docker system prune -af --filter 'until=168h' && df -h / | awk 'NR<=2'")
+APT_UPGRADE = _script("""
+apt-get update -qq
+apt-get -y -qq -o Dpkg::Options::=--force-confold upgrade
+[ -f /var/run/reboot-required ] && echo "⚠️ нужна перезагрузка" || echo "перезагрузка не нужна"
+""")
+
+
 SSH_STATUS = _script("""
 sshd -T 2>/dev/null | grep -iE '^(port|permitrootlogin|passwordauthentication|pubkeyauthentication) ' || true
 """)
@@ -676,6 +796,7 @@ UPDATES = {
     "panel": _script(_compose_restart("/opt/remnawave") + "\ndocker image prune -f >/dev/null || true"),
     "subpage": _script(_compose_restart("/opt/remnawave/subscription")),
     "caddy": _script(_compose_restart(CADDY_DIR) + "\ncaddy_networks"),
+    "nginx": _script(_compose_restart(NGINX_DIR) + "\nproxy_networks nginx"),
     "node": _script(_compose_restart("/opt/remnanode") + "\ndocker image prune -f >/dev/null || true"),
     "selfsteal": _script(_compose_restart(NGINX_SS_DIR)),
     "cabinet": _script(_compose_restart(CABINET_DIR)),

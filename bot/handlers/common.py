@@ -20,10 +20,10 @@ async def main_text() -> str:
             f"Нод: {await db.count(db.Node)} · Ботов: {await db.count(db.Bedolaga)}")
 
 
-MAIN_KB = kb([("📦 Установка проектов", "inst")],
-             [("🛠 Управление", "mng")],
-             [("🔐 Доступы и серверы", "acc"), ("🔑 SSH-ключи", "key:list")],
-             [("⚙️ Бот", "bot"), ("❓ Помощь", "help")])
+MAIN_KB = kb([("📦 Установка", "inst"), ("🛠 Управление", "mng")],
+             [("🖥 Серверы", "srv:list"), ("🔑 SSH-ключи", "key:list")],
+             [("📇 Доступы", "acc"), ("⚙️ Бот", "bot")],
+             [("❓ Помощь", "help")])
 
 
 @router.message(CommandStart())
@@ -42,10 +42,13 @@ async def menu(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "help")
 async def help_(c: CallbackQuery):
     await show(c, "❓ <b>Как пользоваться</b>\n\n"
-                  "<b>📦 Установка</b> — Remnawave (панель + подписка + Caddy), Bedolaga Bot, Bedolaga Cabinet. "
-                  "В первом шаге выбираешь сервер и способ входа: пароль или SSH-ключ.\n\n"
+                  "<b>📦 Установка</b> — Remnawave (панель + подписка + Caddy/Nginx, секретный путь по желанию), "
+                  "Bedolaga Bot и Cabinet (на тот же сервер или отдельный), подключение существующей панели "
+                  "с перенастройкой прокси.\n\n"
+                  "<b>🖥 Серверы</b> — добавление (IP, пользователь, пароль или ключ), состояние, терминал, "
+                  "безопасность: UFW, IPv6, ping, BBR, SSH-порт, вход по ключу/паролю.\n\n"
                   "<b>🛠 Управление</b>\n"
-                  "• Панели: ноды (self-steal Caddy + remnanode), профили Reality/Hysteria2, сквады\n"
+                  "• Панели: ноды (self-steal certbot + Nginx), хосты, профили Reality/Hysteria2, сквады\n"
                   "• Модификации: Link Extractor, Backup-Restore (на панель, свой бот), WARP (на ноду)\n"
                   "• Безопасность: UFW, вход по паролю вкл/выкл, ключи, секретная ссылка панели\n"
                   "• Обновления: всё по отдельности\n\n"

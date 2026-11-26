@@ -47,6 +47,7 @@ class Server(Stamp, Base):
     password_enc: Mapped[str | None] = mapped_column(Text)
     key_id: Mapped[int | None] = mapped_column(ForeignKey("ssh_keys.id", ondelete="SET NULL"))
     host_key: Mapped[str | None] = mapped_column(Text)  # TOFU-отпечаток
+    proxy: Mapped[str | None] = mapped_column(String(16))  # caddy | nginx — наш reverse proxy на сервере
     notes: Mapped[str | None] = mapped_column(Text)
 
 
@@ -65,6 +66,7 @@ class Panel(Stamp, Base):
     protected: Mapped[bool] = mapped_column(Boolean, default=False)  # секретная ссылка/cookie
     cookie_enc: Mapped[str | None] = mapped_column(Text)
     link_extractor: Mapped[bool] = mapped_column(Boolean, default=False)
+    sub_local: Mapped[bool] = mapped_column(Boolean, default=True)  # страница подписки на сервере панели
 
 
 class Node(Stamp, Base):
@@ -127,6 +129,8 @@ class Log(Stamp, Base):
 # Простые миграции для уже работающих баз (create_all не добавляет колонки).
 MIGRATIONS = [
     "ALTER TABLE ssh_keys ALTER COLUMN private_enc DROP NOT NULL",
+    "ALTER TABLE servers ADD COLUMN IF NOT EXISTS proxy VARCHAR(16)",
+    "ALTER TABLE panels ADD COLUMN IF NOT EXISTS sub_local BOOLEAN DEFAULT TRUE",
 ]
 
 

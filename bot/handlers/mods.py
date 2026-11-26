@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
-from .. import crypto, db, scripts, terminal, xray
+from .. import crypto, db, proxy, scripts, terminal, xray
 from ..forms import Field, form, start_form
 from ..rw_api import RwError, for_panel
 from ..runner import run_task
@@ -66,8 +66,9 @@ async def le_view(c: CallbackQuery):
         return await show(c, "🔗 <b>Link Extractor</b> (github.com/tneange1/link-extractor)\n\n"
                              "Ставится на сервер панели вместе со своим Telegram-ботом. "
                              "Нужен токен отдельного бота от @BotFather.\n"
-                             + ("Caddy управляется ботом — маршруты пропишу сам." if p.managed_proxy else
-                                "⚠️ Caddy ставил не vpn-master: маршруты в reverse proxy настрой сам "
+                             + ("Reverse proxy управляется ботом — маршруты пропишу сам." if p.managed_proxy else
+                                "⚠️ Reverse proxy ставил не vpn-master (подключи панель с настройкой прокси) — "
+                                "пока маршруты настрой сам "
                                 "(подписка → link-extractor:3020, /link-extractor/ → link-extractor:3020)."),
                           kb([("➕ Установить", f"le:inst:{i}")], [("⬅️ Назад", f"mod:p:{i}")]))
     await show(c, f"🔗 <b>Link Extractor · {h(p.name)}</b> ✅\nАдмины бота: <code>{h(m.admin_ids)}</code>\n"
@@ -97,8 +98,8 @@ async def le_inst_done(event, values, ctx):
     if res.ok and p.managed_proxy:
         p.link_extractor = True
         await db.save(p)
-        await run_task(event.bot, chat_id(event), server, "Маршруты Caddy для Link Extractor",
-                       scripts.apply_panel_site(p.domain, p.sub_domain, crypto.dec(p.cookie_enc) if p.protected else None, True))
+        await run_task(event.bot, chat_id(event), server, "Маршруты прокси для Link Extractor",
+                       proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, proxy.panel_cookie(p))))
     await say(event, f"{'✅' if res.ok else '⚠️'} Link Extractor установлен. API-токен Remnawave задай в его боте "
                      "(⚙️ Настройки).", kb([("🔐 Секреты", f"le:sec:{p.id}"), ("⬅️ Назад", f"mod:p:{p.id}")]))
 
@@ -137,8 +138,8 @@ async def le_remove(c: CallbackQuery, bot: Bot):
     if p.link_extractor and p.managed_proxy:
         p.link_extractor = False
         await db.save(p)
-        await run_task(bot, c.message.chat.id, server, "Маршруты Caddy",
-                       scripts.apply_panel_site(p.domain, p.sub_domain, crypto.dec(p.cookie_enc) if p.protected else None, False))
+        await run_task(bot, c.message.chat.id, server, "Маршруты прокси",
+                       proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, proxy.panel_cookie(p))))
     await say(c, "🗑 Link Extractor остановлен.", kb([("⬅️ Назад", f"mod:p:{p.id}")]))
 
 

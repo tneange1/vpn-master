@@ -141,9 +141,8 @@ async def ensure_server(event, values) -> db.Server | None:
 # ---------------------------------------------------------------- меню «Доступы»
 @router.callback_query(F.data == "acc")
 async def access_menu(c: CallbackQuery):
-    await show(c, "🔐 <b>Доступы и серверы</b>\n\nСерверы, SSH-ключи, пароли, токены панелей и ботов.",
-               kb([("🖥 Серверы", "srv:list"), ("🔑 SSH-ключи", "key:list")],
-                  [("📇 Панели: логины и токены", "acc:panels")],
+    await show(c, "📇 <b>Доступы</b>\n\nЛогины, пароли и токены панелей и ботов.",
+               kb([("📇 Панели: логины и токены", "acc:panels")],
                   [("🤖 Боты: токены", "acc:bots")],
                   [("⬅️ Назад", "menu")]))
 
@@ -153,8 +152,9 @@ async def srv_list(c: CallbackQuery):
     servers = await db.all_(db.Server)
     rows = [[(f"{await server_label(s)} · {AUTH_LABEL.get(s.auth, s.auth)}", f"srv:v:{s.id}")] for s in servers]
     rows.append([("➕ Добавить сервер", "srv:add")])
-    rows.append([("⬅️ Назад", "acc")])
-    await show(c, f"🖥 <b>Серверы</b> ({len(servers)})", kb(*rows))
+    rows.append([("⬅️ Меню", "menu")])
+    await show(c, f"🖥 <b>Серверы</b> ({len(servers)})\nВ карточке: состояние, терминал, команды, пароль, "
+                  "способ входа, безопасность (UFW, IPv6, ping, BBR, SSH-порт), обслуживание.", kb(*rows))
 
 
 @form("srv_add", "➕ Новый сервер", SERVER_FIELDS)
@@ -194,11 +194,52 @@ async def srv_view(c: CallbackQuery):
         return await c.answer("Нет такого", show_alert=True)
     i = s.id
     await show(c, await _server_text(s), kb(
-        [("🔌 Проверить", f"srv:chk:{i}"), ("💻 Терминал", f"srv:term:{i}"), ("⌨️ Команда", f"srv:cmd:{i}")],
+        [("📊 Состояние", f"srv:state:{i}"), ("🔌 Проверить", f"srv:chk:{i}")],
+        [("💻 Терминал", f"srv:term:{i}"), ("⌨️ Команда", f"srv:cmd:{i}")],
         [("👁 Показать пароль", f"srv:pw:{i}"), ("✏️ Сменить пароль", f"srv:setpw:{i}")],
         [("🔁 Способ входа", f"srv:auth:{i}"), ("🛡 Безопасность", f"sec:s:{i}")],
-        [("♻️ Сбросить host key", f"srv:hk:{i}"), ("🗑 Удалить", f"srv:del:{i}")],
+        [("🧹 Обслуживание", f"srv:mnt:{i}"), ("🔄 Перезагрузить", f"srv:rb:{i}")],
+        [("♻️ Сбросить host key", f"srv:hk:{i}"), ("🗑 Удалить из бота", f"srv:del:{i}")],
         [("⬅️ Серверы", "srv:list")]))
+
+
+@router.callback_query(F.data.startswith("srv:state:"))
+async def srv_state(c: CallbackQuery, bot: Bot):
+    s = await db.get(db.Server, c.data.split(":")[2])
+    await c.answer()
+    await run_task(bot, c.message.chat.id, s, "Состояние сервера", scripts.SERVER_STATE)
+
+
+@router.callback_query(F.data.startswith("srv:mnt:"))
+async def srv_maint(c: CallbackQuery):
+    i = c.data.split(":")[2]
+    await show(c, "🧹 <b>Обслуживание</b>",
+               kb([("⬆️ Обновить пакеты (apt upgrade)", f"srv:apt:{i}")],
+                  [("🐳 Почистить Docker (старше 7 дней)", f"srv:prune:{i}")],
+                  [("⬅️ К серверу", f"srv:v:{i}")]))
+
+
+@router.callback_query(F.data.startswith(("srv:apt:", "srv:prune:")))
+async def srv_maint_run(c: CallbackQuery, bot: Bot):
+    s = await db.get(db.Server, c.data.split(":")[2])
+    apt = c.data.startswith("srv:apt:")
+    await c.answer()
+    await run_task(bot, c.message.chat.id, s, "apt upgrade" if apt else "docker prune",
+                   scripts.APT_UPGRADE if apt else scripts.DOCKER_PRUNE)
+
+
+@router.callback_query(F.data.startswith("srv:rb:"))
+async def srv_reboot(c: CallbackQuery):
+    i = c.data.split(":")[2]
+    await show(c, "🔄 Перезагрузить сервер? Контейнеры с restart: always поднимутся сами.",
+               kb([("🔄 Да, перезагрузить", f"srv:rbok:{i}"), ("✖️ Нет", f"srv:v:{i}")]))
+
+
+@router.callback_query(F.data.startswith("srv:rbok:"))
+async def srv_reboot_ok(c: CallbackQuery, bot: Bot):
+    s = await db.get(db.Server, c.data.split(":")[2])
+    await c.answer()
+    await run_task(bot, c.message.chat.id, s, "Перезагрузка", scripts.SERVER_REBOOT)
 
 
 @router.callback_query(F.data.startswith("srv:chk:"))

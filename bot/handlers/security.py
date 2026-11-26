@@ -22,10 +22,10 @@ async def sec_menu(c: CallbackQuery):
     servers = await db.all_(db.Server)
     panels = await db.all_(db.Panel)
     rows = [[(await server_label(s), f"sec:s:{s.id}")] for s in servers]
-    rows += [[(f"🔒 Защита панели {p.name}", f"sec:p:{p.id}")] for p in panels]
+    rows += [[(f"🔒 Секретный путь · {p.name}", f"sec:p:{p.id}")] for p in panels]
     rows.append([("⬅️ Назад", "mng")])
     await show(c, "🛡 <b>Безопасность</b>\n\nСервер: UFW, IPv6, ping, SSH-порт, вход по паролю, root.\n"
-                  "Панель: секретный путь в Caddy/Nginx (docs.rw/install/panel-security).", kb(*rows))
+                  "Панель: секретный путь (вход https://панель/КЛЮЧ, API — X-Api-Key).", kb(*rows))
 
 
 async def _srv(c: CallbackQuery, idx: int = 2) -> db.Server | None:
@@ -275,43 +275,62 @@ async def ssh_port(c: CallbackQuery, state: FSMContext):
     await start_form(c, state, "ssh_port", ctx={"id": int(c.data.split(":")[2])})
 
 
-# ------------------------------------------------------------------ защита панели
+# ------------------------------------------------------------------ защита панели (секретный путь = X-Api-Key)
 @router.callback_query(F.data.startswith("sec:p:"))
 async def sec_panel(c: CallbackQuery):
     p = await db.get(db.Panel, c.data.split(":")[2])
     i = p.id
+    key = proxy.panel_cookie(p)
+    text = (f"🔒 <b>Секретный путь · {h(p.name)}</b>: {'включён' if key else 'выключен'}\n\n"
+            "Один ключ на всё:\n"
+            "• браузер — <code>https://панель/КЛЮЧ</code> (поставит cookie и пустит в панель);\n"
+            "• API (Bedolaga, этот бот) — заголовок <code>X-Api-Key: КЛЮЧ</code>;\n"
+            "• всем остальным соединение рвётся. Домен подписки остаётся открытым.")
+    if key:
+        text += (f"\n\nВход: <tg-spoiler>{h(proxy.login_url(p.domain, key))}</tg-spoiler>\n"
+                 f"X-Api-Key: <tg-spoiler><code>{h(key)}</code></tg-spoiler>")
     if not p.managed_proxy:
-        return await show(c, "🔒 Reverse proxy этой панели ставил не бот — его я не трогаю.\n"
-                             "Чтобы бот взял прокси под себя: Установка → 🔗 Подключить панель → «настроить прокси» "
-                             "(старый прокси будет забэкаплен, при ошибке — откат).", kb([("⬅️ Назад", "sec")]))
-    status = "🔒 включена" if p.protected else "выключена"
-    text = (f"🔒 <b>Защита панели {h(p.name)}</b>: {status}\n\n"
-            f"{proxy.KINDS.get(proxy.kind_of(await db.get(db.Server, p.server_id)), '')} пускает в панель только с cookie. Cookie выдаётся по секретной ссылке "
-            "<code>https://панель/?vmkey=…</code>; без неё соединение сбрасывается. Страница подписки "
-            "на своём домене остаётся открытой.")
-    if p.protected:
-        text += f"\n\nСсылка для входа: <tg-spoiler>https://{h(p.domain)}/?vmkey={h(crypto.dec(p.cookie_enc))}</tg-spoiler>"
-    await show(c, text, kb([("✅ Включить / новый ключ", f"sec:pon:{i}"), ("⛔️ Выключить", f"sec:poff:{i}")],
-                           [("⬅️ Назад", "sec")]))
+        text += "\n\n⚠️ Прокси сейчас не от бота — при включении бот заберёт его на себя (🩹 фикс с бэкапом и откатом)."
+    await show(c, text, kb([("✨ Включить с новым ключом", f"sec:pon:{i}"), ("✏️ Свой ключ", f"sec:pkey:{i}")],
+                           [("⛔️ Выключить", f"sec:poff:{i}")],
+                           [("⬅️ Назад", "sec"), ("🖥 Панель", f"pn:v:{i}")]))
+
+
+async def _apply_key(event, bot: Bot, p: db.Panel, key: str | None):
+    """Сохранить ключ и пересобрать прокси сервера (фикс), затем Bedolaga получит новый X-Api-Key."""
+    from ..discover import fix_proxy
+    server = await db.get(db.Server, p.server_id)
+    if not server:
+        return await say(event, "❌ У панели нет SSH-сервера.", kb([("🖥 Сервер панели", f"pn:srv:{p.id}")]))
+    old = (p.protected, p.cookie_enc)
+    p.protected, p.cookie_enc = bool(key), crypto.enc(key) if key else None
+    p = await db.save(p)
+    ok = await fix_proxy(bot, chat_id(event), server)
+    if not ok:
+        p.protected, p.cookie_enc = old
+        await db.save(p)
+        return await say(event, "❌ Не применилось — ключ не меняю.", kb([("⬅️ Назад", f"sec:p:{p.id}")]))
+    await say(event, "✅ Секретный путь " + ("включён." if key else "выключен."), kb([("⬅️ Назад", f"sec:p:{p.id}")]))
 
 
 @router.callback_query(F.data.startswith(("sec:pon:", "sec:poff:")))
 async def sec_panel_toggle(c: CallbackQuery, bot: Bot):
     p = await db.get(db.Panel, c.data.split(":")[2])
-    server = await db.get(db.Server, p.server_id)
-    if not server:
-        return await c.answer("У панели нет SSH-сервера", show_alert=True)
-    on = c.data.startswith("sec:pon:")
-    cookie = secrets.token_urlsafe(24).replace("-", "x").replace("_", "y") if on else None
     await c.answer()
-    res = await run_task(bot, c.message.chat.id, server, f"Защита панели {'ВКЛ' if on else 'ВЫКЛ'}",
-                         proxy.apply_script(proxy.kind_of(server), proxy.sname("panel", p.id), proxy.panel_sites(p, cookie)))
-    if res.ok:
-        p.protected, p.cookie_enc = on, crypto.enc(cookie) if cookie else None
-        p = await db.save(p)
-        await proxy.sync_bedolaga_token(bot, c.message.chat.id, p)
-        msg = (f"✅ Включено. Вход: <tg-spoiler>https://{h(p.domain)}/?vmkey={h(cookie)}</tg-spoiler>\n"
-               "API-клиенты проходят с заголовком <code>X-Api-Key</code> = этот ключ; "
-               "ботам Bedolaga панели он прописан в REMNAWAVE_CADDY_TOKEN.") \
-            if on else "✅ Защита выключена."
-        await say(c, msg, kb([("⬅️ Назад", f"sec:p:{p.id}")]))
+    key = secrets.token_urlsafe(24).replace("-", "x").replace("_", "y") if c.data.startswith("sec:pon:") else None
+    await _apply_key(c, bot, p, key)
+
+
+@form("sec_pkey", "✏️ Свой ключ секретного пути", [
+    Field("key", "Пришли ключ (он же <code>X-Api-Key</code> и путь входа <code>https://панель/КЛЮЧ</code>): "
+                 "8–128 символов, латиница, цифры, <code>-</code> и <code>_</code>. Сообщение удалю.", secret=True)])
+async def sec_pkey_done(event, values, ctx):
+    key = values["key"].strip()
+    if not re.match(proxy.KEY_RE, key):
+        return await say(event, "❌ Ключ: 8–128 символов из A-Z a-z 0-9 - _", kb([("🔁 Ещё раз", f"sec:pkey:{ctx['id']}")]))
+    await _apply_key(event, event.bot, await db.get(db.Panel, ctx["id"]), key)
+
+
+@router.callback_query(F.data.startswith("sec:pkey:"))
+async def sec_pkey(c: CallbackQuery, state: FSMContext):
+    await start_form(c, state, "sec_pkey", ctx={"id": int(c.data.split(":")[2])})

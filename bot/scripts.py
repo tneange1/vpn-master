@@ -464,8 +464,7 @@ def bedolaga_install(*, bot_token: str, admin_ids: str, hooks_domain: str, rw_ur
         "POSTGRES_DB": "remnawave_bot", "POSTGRES_USER": "remnawave_user", "POSTGRES_PASSWORD": pg_pass,
     }
     if rw_cookie:  # секретный путь панели: AUTH_TYPE=caddy → X-Api-Key = CADDY_TOKEN, плюс cookie
-        env.update({"REMNAWAVE_AUTH_TYPE": "caddy", "REMNAWAVE_CADDY_TOKEN": rw_cookie,
-                    "REMNAWAVE_SECRET_KEY": f"vmkey:{rw_cookie}"})
+        env.update({"REMNAWAVE_AUTH_TYPE": "caddy", "REMNAWAVE_CADDY_TOKEN": rw_cookie, "REMNAWAVE_SECRET_KEY": ""})
     sets = "\n".join(f"set_env .env {k} {q(v)}" for k, v in env.items())
     return _script(f"""
 need_docker
@@ -827,9 +826,9 @@ UPDATES = {
 }
 
 
-def bedolaga_update(compose_file: str) -> str:
+def bedolaga_update(compose_file: str, bot_dir: str = BEDOLAGA_DIR) -> str:
     return _script(f"""
-cd {BEDOLAGA_DIR}
+cd {q(bot_dir)}
 git pull --ff-only
 docker compose -f {q(compose_file)} up -d --build
 docker image prune -f >/dev/null || true
@@ -837,13 +836,13 @@ docker compose -f {q(compose_file)} ps
 """)
 
 
-def bedolaga_env(compose_file: str, env: dict) -> str:
+def bedolaga_env(compose_file: str, env: dict, bot_dir: str = BEDOLAGA_DIR) -> str:
     """Поменять переменные .env Bedolaga и перезапустить бота. Значение None — удалить переменную."""
     lines = []
     for k, v in env.items():
         lines.append(f"sed -i '/^{k}=/d' .env" if v is None else f"set_env .env {k} {q(v)}")
     return _script(f"""
-cd {BEDOLAGA_DIR} || {{ echo "Bedolaga не найден"; exit 2; }}
+cd {q(bot_dir)} || {{ echo "Bedolaga не найден в {bot_dir}"; exit 2; }}
 {chr(10).join(lines)}
 docker compose -f {q(compose_file)} up -d
 log "Bedolaga перезапущен с новыми настройками"
@@ -855,6 +854,75 @@ for px in caddy nginx; do
   if running "$px"; then proxy_networks "$px"; log "$px подключён к сетям:"; docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$px"; fi
 done
 """)
+
+
+# ===================================================================== Обнаружение (фикс прокси, Bedolaga)
+DISCOVER = _script(r"""
+envv(){ grep -E "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true; }
+lbl(){ docker inspect -f "{{ index .Config.Labels \"$2\" }}" "$1" 2>/dev/null | sed 's/<no value>//' || true; }
+command -v docker >/dev/null 2>&1 || { echo "docker не установлен"; exit 0; }
+i=0
+for c in $(docker ps --format '{{.Names}}'); do
+  i=$((i+1))
+  img=$(docker inspect -f '{{.Config.Image}}' "$c")
+  nets=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}},{{end}}' "$c")
+  ports=$(docker port "$c" 2>/dev/null | tr '\n' ',' || true)
+  mark "CT$i" "$c|$img|$(lbl "$c" com.docker.compose.project.working_dir)|$(lbl "$c" com.docker.compose.project.config_files)|$nets|$ports"
+  echo "контейнер: $c ($img)"
+done
+RWD=$(lbl remnawave com.docker.compose.project.working_dir); RWD=${RWD:-/opt/remnawave}
+for k in FRONT_END_DOMAIN SUB_PUBLIC_DOMAIN; do mark "RW_$k" "$(envv "$RWD/.env" $k)"; done
+SPD=$(lbl remnawave-subscription-page com.docker.compose.project.working_dir)
+[ -n "$SPD" ] && mark SP_APP_PORT "$(envv "$SPD/.env" APP_PORT)"
+BOTC=$(docker ps --format '{{.Names}}' | grep -xE 'remnawave_bot|bedolaga_bot|remnawave-bedolaga-telegram-bot' | head -1 || true)
+if [ -n "$BOTC" ]; then
+  BD=$(lbl "$BOTC" com.docker.compose.project.working_dir)
+  mark BD_CT "$BOTC"; mark BD_DIR "$BD"; mark BD_COMPOSE "$(basename "$(lbl "$BOTC" com.docker.compose.project.config_files | cut -d, -f1)")"
+  for k in BOT_TOKEN ADMIN_IDS WEBHOOK_URL BOT_RUN_MODE CABINET_ENABLED CABINET_ALLOWED_ORIGINS REMNAWAVE_API_URL REMNAWAVE_AUTH_TYPE WEB_API_DEFAULT_TOKEN; do
+    mark "BD_$k" "$(envv "$BD/.env" $k)"
+  done
+  echo "Bedolaga: $BOTC ($BD)"
+fi
+# ключ X-Api-Key из текущего Caddyfile (если прокси ставили вручную)
+for c in $(docker ps --format '{{.Names}}|{{.Ports}}' | grep -E ':443->' | cut -d'|' -f1); do
+  wd=$(lbl "$c" com.docker.compose.project.working_dir); mark PROXY "$c|$(docker inspect -f '{{.Config.Image}}' "$c")|$wd"
+  for f in "$wd/Caddyfile" "$wd"/*.caddy "$wd"/sites/*.caddy; do
+    [ -f "$f" ] || continue
+    k=$(grep -oE 'X-Api-Key[[:space:]]+[^[:space:]}]+' "$f" 2>/dev/null | head -1 | awk '{print $2}' || true)
+    case "$k" in \{\$*) v=${k#\{\$}; v=${v%\}}; k=$(envv "$wd/.env" "$v");; esac
+    if [ -n "$k" ]; then mark FOREIGN_KEY "$k"; echo "в $f найден ключ X-Api-Key"; break; fi
+  done
+done
+for px in nginx caddy apache2; do systemctl is-active --quiet "$px" 2>/dev/null && mark HOST_PROXY "$px"; done
+true
+""")
+
+BEDOLAGA_STATUS = _script(r"""
+docker ps -a --format 'table {{.Names}}\t{{.Status}}' | grep -iE 'NAMES|bot|bedolaga|cabinet|postgres|redis' || true
+echo; curl -s --max-time 5 http://127.0.0.1:8080/health 2>/dev/null | head -c 400 || true
+""")
+
+
+def bedolaga_cmd(bot_dir: str, compose_file: str, action: str) -> str:
+    f = q(compose_file)
+    cmds = {
+        "restart": f"docker compose -f {f} restart && docker compose -f {f} ps",
+        "logs": f"docker compose -f {f} logs --tail 120 --no-color 2>&1 | tail -120",
+        "up": f"docker compose -f {f} up -d && docker compose -f {f} ps",
+        "env": "grep -vE '^\\s*(#|$)' .env | sed -E 's/^([A-Z0-9_]*(TOKEN|KEY|SECRET|PASSWORD)[A-Z0-9_]*=).+/\\1***/'",
+    }
+    return _script(f"cd {q(bot_dir)} || {{ echo 'нет каталога {bot_dir}'; exit 2; }}\n{cmds[action]}")
+
+
+def cabinet_cmd(cab_ct: str, action: str) -> str:
+    c = q(cab_ct)
+    cmds = {
+        "logs": f"docker logs --tail 80 {c} 2>&1",
+        "restart": f"docker restart {c} && docker ps --filter name={c}",
+        "update": f"wd=$(docker inspect -f '{{{{ index .Config.Labels \"com.docker.compose.project.working_dir\" }}}}' {c}); "
+                  f"cd \"$wd\" && docker compose pull && docker compose up -d && docker ps --filter name={c}",
+    }
+    return _script(cmds[action])
 
 
 def custom(cmd: str) -> str:

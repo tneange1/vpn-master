@@ -24,8 +24,8 @@ class RW:
         self.token, self.username, self.password = token, username, password
         self.cache_key = f"{self.base}|{username}"
         headers = {"X-Forwarded-Proto": "https", "X-Forwarded-For": "127.0.0.1"}
-        cookies = {cookie[0]: cookie[1]} if cookie else None
-        if cookie:  # секретный путь пропускает и по заголовку
+        cookies = None
+        if cookie:  # секретный путь панели → X-Api-Key
             headers["X-Api-Key"] = cookie[1]
         self.c = httpx.AsyncClient(base_url=self.base, headers=headers, cookies=cookies, timeout=30)
 
@@ -171,7 +171,7 @@ class RW:
 def for_panel(panel: db.Panel) -> RW:
     cookie = None
     if panel.protected and panel.cookie_enc:
-        cookie = ("vmkey", crypto.dec(panel.cookie_enc))
+        cookie = ("X-Api-Key", crypto.dec(panel.cookie_enc))
     return RW(panel.api_url, crypto.dec(panel.api_token_enc), cookie,
               panel.admin_user, crypto.dec(panel.admin_pass_enc))
 

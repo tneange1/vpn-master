@@ -20,8 +20,9 @@ router = Router(name="panels")
 @router.callback_query(F.data == "mng")
 async def manage_menu(c: CallbackQuery):
     await show(c, "🛠 <b>Управление</b>",
-               kb([("🖥 Панели", "pn:list"), ("🧩 Модификации", "mod")],
-                  [("🛡 Безопасность", "sec"), ("⬆️ Обновления", "upd")],
+               kb([("🖥 Панели", "pn:list"), ("🤖 Bedolaga", "bd:list")],
+                  [("🧩 Модификации", "mod"), ("🛡 Безопасность", "sec")],
+                  [("⬆️ Обновления", "upd")],
                   [("⬅️ Назад", "menu")]))
 
 
@@ -56,15 +57,15 @@ async def panel_view(c: CallbackQuery):
             f"Подписка: {('https://' + h(p.sub_domain)) if p.sub_domain else '—'}\n"
             f"Сервер (SSH): {h(server.name + ' · ' + server.host) if server else '— не привязан'}\n"
             f"Доступ к API: {_api_label(p)}\n"
-            f"Прокси: {(server.proxy or 'caddy').capitalize() + ' от vpn-master' if p.managed_proxy and server else 'не наш'}"
-            f" · Секретный путь: {'🔒' if p.protected else 'выкл'}\n"
+            f"Прокси: {(server.proxy or 'caddy').capitalize() + ' от vpn-master' if p.managed_proxy and server else 'не от бота'}"
+            f" · Секретный путь (X-Api-Key): {'🔒' if p.protected else 'выкл'}\n"
             f"Нод в боте: {len(nodes)}")
     await show(c, text, kb(
         [("🛰 Ноды", f"pn:nodes:{i}"), ("🌐 Хосты", f"hs:list:{i}:0")],
         [("🧬 Профили", f"pn:prof:{i}"), ("👥 Сквады", f"pn:sq:{i}")],
         [("🔗 Link Extractor", f"lx:v:{i}"), ("🧩 Модификации", f"mod:p:{i}")],
         [("🔑 Доступ к API", f"pn:api:{i}"), ("🖥 Сервер панели", f"pn:srv:{i}")],
-        [("🧭 Reverse proxy", f"pn:px:{i}"), ("⬆️ Обновления", f"upd:p:{i}")],
+        [("🩹 Фикс reverse proxy", f"pn:fix:{i}"), ("⬆️ Обновления", f"upd:p:{i}")],
         [("🗑 Убрать из бота", f"pn:del:{i}")],
         [("⬅️ Панели", "pn:list")]))
 
@@ -161,58 +162,18 @@ async def pn_mktok(c: CallbackQuery):
     await say(c, "✅ API-токен выпущен и сохранён.", kb([("⬅️ Доступ к API", f"pn:api:{p.id}")]))
 
 
-# ------------------------------------------------------------------ reverse proxy панели
-@router.callback_query(F.data.startswith("pn:px:"))
-async def pn_proxy(c: CallbackQuery):
-    from .. import proxy
+# ------------------------------------------------------------------ 🩹 фикс reverse proxy
+@router.callback_query(F.data.startswith("pn:fix:"))
+async def pn_fix(c: CallbackQuery):
+    from ..discover import fix_proxy
     p = await db.get(db.Panel, c.data.split(":")[2])
     server = await db.get(db.Server, p.server_id)
-    i = p.id
     if not server:
-        return await show(c, "🧭 Сначала привяжи SSH-сервер панели.", kb([("🖥 Сервер панели", f"pn:srv:{i}")],
-                                                                         [("⬅️ К панели", f"pn:v:{i}")]))
-    groups = await proxy.server_groups(server)
-    sites = "\n".join(f"• {x.domain}" + (" 🔒" if x.cookie else "") + (" (+меню экстрактора)" if x.html_upstream else "")
-                      for _, ss in groups for x in ss)
-    if p.managed_proxy:
-        kind = proxy.kind_of(server)
-        return await show(c, f"🧭 <b>Reverse proxy · {h(server.name)}</b>\n{kind.capitalize()} от vpn-master\n\n"
-                             f"Сайты на сервере:\n{h(sites)}\n\n"
-                             "«Пересобрать» заново сгенерирует конфиг всех сайтов сервера (панель, подписка, "
-                             "экстрактор, Bedolaga, кабинет), проверит и применит; при ошибке вернёт прежний.",
-                          kb([("🔁 Пересобрать конфиг", f"pn:pxr:{i}")],
-                             [("🔒 Секретный путь", f"sec:p:{i}"), ("🩹 Сети (502)", f"srv:nets:{server.id}")],
-                             [("⬅️ К панели", f"pn:v:{i}")]))
-    await show(c, f"🧭 <b>Reverse proxy · {h(server.name)}</b>\nСейчас прокси ставил не бот.\n\n"
-                  f"Бот может взять его на себя: бэкап текущего (80/443) → свой Caddy/Nginx со всеми сайтами:\n{h(sites)}\n"
-                  "→ проверка панели → при ошибке откат.",
-               kb([("🔒 Caddy + секретный путь", f"pn:pxt:{i}:caddy:1"), ("🔒 Nginx + секретный путь", f"pn:pxt:{i}:nginx:1")],
-                  [("Caddy", f"pn:pxt:{i}:caddy:0"), ("Nginx", f"pn:pxt:{i}:nginx:0")],
-                  [("⬅️ К панели", f"pn:v:{i}")]))
-
-
-@router.callback_query(F.data.startswith("pn:pxt:"))
-async def pn_proxy_takeover(c: CallbackQuery):
-    import json as _json
-    _, _, pid, kind, protect = c.data.split(":")
-    await db.set_setting(f"rwx:{pid}", _json.dumps({"kind": kind, "protect": protect == "1", "hooks": None,
-                                                    "cabinet": None, "email": await db.setting("acme_email")}))
-    await show(c, f"Поставить {kind.capitalize()}{' с секретным путём' if protect == '1' else ''}?\n"
-                  "Панель может быть недоступна около минуты.",
-               kb([("✅ Да, настроить", f"rwx:go:{pid}")], [("✖️ Отмена", f"pn:px:{pid}")]))
-
-
-@router.callback_query(F.data.startswith("pn:pxr:"))
-async def pn_proxy_rebuild(c: CallbackQuery):
-    from .. import proxy
-    p = await db.get(db.Panel, c.data.split(":")[2])
-    server = await db.get(db.Server, p.server_id)
-    await c.answer()
-    groups = await proxy.server_groups(server)
-    res = await run_task(c.bot, c.message.chat.id, server, f"{proxy.kind_of(server).capitalize()}: пересборка",
-                         proxy.rebuild_script(proxy.kind_of(server), groups, await db.setting("acme_email")))
-    await say(c, "✅ Прокси пересобран." if res.ok else "❌ Не вышло — прежний конфиг возвращён. Лог выше.",
-              kb([("⬅️ Reverse proxy", f"pn:px:{p.id}")]))
+        return await show(c, "🩹 Сначала привяжи SSH-сервер панели.", kb([("🖥 Сервер панели", f"pn:srv:{p.id}")],
+                                                                        [("⬅️ К панели", f"pn:v:{p.id}")]))
+    await c.answer("Чиню прокси…")
+    await fix_proxy(c.bot, c.message.chat.id, server)
+    await say(c, "—", kb([("⬅️ К панели", f"pn:v:{p.id}")]))
 
 
 # ------------------------------------------------------------------ сервер панели

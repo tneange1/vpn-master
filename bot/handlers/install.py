@@ -44,7 +44,7 @@ PROXY_CHOICES = [("Caddy — сертификаты сам (рекомендую
 
 
 def _login_url(domain: str, cookie: str | None) -> str:
-    return f"https://{domain}/?vmkey={cookie}" if cookie else f"https://{domain}"
+    return proxy.login_url(domain, cookie)
 
 
 async def _pick_proxy(event, server: db.Server, wanted: str | None) -> str:
@@ -78,7 +78,8 @@ async def install_menu(c: CallbackQuery):
     Field("admin", "Логин супер-админа (пароль сгенерирую сам):", optional=True, default="admin"),
     Field("proxy", "Reverse proxy:", "choice", choices=PROXY_CHOICES),
     Field("protect", "Закрыть панель секретным путём (docs.rw/install/panel-security)?\n"
-                     "Вход будет только по ссылке <code>https://панель/?vmkey=…</code>, остальным — обрыв.",
+                     "Браузер — по ссылке <code>https://панель/КЛЮЧ</code>, API — с заголовком <code>X-Api-Key: КЛЮЧ</code>, "
+                     "остальным — обрыв соединения.",
           "choice", choices=[("🔒 Да, закрыть", True), ("Нет", False)]),
     Field("email", "E-mail для Let's Encrypt:", optional=True, default="", when=lambda v: v.get("proxy") == "nginx"),
 ])

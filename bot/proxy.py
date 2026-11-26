@@ -1,12 +1,10 @@
 """Reverse proxy: одно описание сайтов → Caddyfile или nginx.conf.
 
-Секретный путь (docs.rw/install/panel-security): по ссылке https://домен/?vmkey=TOKEN ставится cookie,
-API-клиенты проходят с заголовком X-Api-Key: TOKEN (или с этой cookie), остальным соединение рвётся
-(Caddy: abort, Nginx: 444). Работает одинаково на обоих прокси.
-
-Link Extractor (как его install.sh): HTML-страницы панели идут через экстрактор — он встраивает пункт
-«Экстрактор ссылок» в меню панели; сам экстрактор живёт на домене подписки, а /link-extractor на домене
-панели перенаправляется туда.
+Секретный путь (как Caddy with custom path, docs.rw/security) — один ключ KEY:
+  • браузер: https://панель/KEY — ставит cookie и пускает в панель;
+  • API (Bedolaga, vpn-master и т.п.): заголовок X-Api-Key: KEY;
+  • остальным соединение рвётся (Caddy: abort, Nginx: 444).
+Link Extractor живёт только на домене подписки, на домене панели его нет.
 """
 import re
 from dataclasses import dataclass, field
@@ -16,6 +14,8 @@ from . import crypto, db, scripts
 
 KINDS = {"caddy": "Caddy (сертификаты сам)", "nginx": "Nginx + certbot"}
 LE_UP = "link-extractor:3020"
+COOKIE = "vm_auth"
+KEY_RE = r"^[A-Za-z0-9_-]{8,128}$"
 
 
 @dataclass
@@ -53,10 +53,10 @@ def render_caddy(sites: list[Site]) -> str:
         lines = []
         if s.cookie:
             c = s.cookie
-            lines += [f"@vmset query vmkey={c}",
-                      f'header @vmset Set-Cookie "vmkey={c}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000"',
-                      "redir @vmset / 302",
-                      f"@vmdeny {{\n\t\t\tnot header Cookie *vmkey={c}*\n\t\t\tnot header X-Api-Key {c}\n\t\t}}",
+            lines += [f"@vmlogin path /{c} /{c}/",
+                      f'header @vmlogin Set-Cookie "{COOKIE}={c}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"',
+                      "redir @vmlogin / 302",
+                      f"@vmdeny {{\n\t\t\tnot header Cookie *{COOKIE}={c}*\n\t\t\tnot header X-Api-Key {c}\n\t\t}}",
                       "abort @vmdeny"]
         for r in s.routes:
             m = r.prefix if r.exact else r.prefix.rstrip("/") + "/*"
@@ -112,13 +112,15 @@ def render_nginx(cert_name: str, sites: list[Site]) -> str:
             c = s.cookie
             cvar = f"$vm_c_{_ident(cert_name)}_{i}"
             # cookie ИЛИ заголовок X-Api-Key (так ходят Bedolaga и API-клиенты)
-            head = (f'map $http_cookie {cvar} {{ default 0; "~(^|;\\s*)vmkey={c}(;|$)" 1; }}\n'
+            head = (f'map $http_cookie {cvar} {{ default 0; "~(^|;\\s*){COOKIE}={c}(;|$)" 1; }}\n'
                     f'map $http_x_api_key {var} {{ default {cvar}; "{c}" 1; }}\n')
-            auth = (f'        if ($arg_vmkey = "{c}") {{\n'
-                    f'            add_header Set-Cookie "vmkey={c}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000" always;\n'
-                    "            return 302 /;\n        }\n"
-                    f"        if ({var} = 0) {{ return 444; }}\n")
-        locs = "".join(_nginx_location(r.prefix, r.upstream, r.strip, auth, exact=r.exact) for r in s.routes)
+            auth = f"        if ({var} = 0) {{ return 444; }}\n"
+        locs = ""
+        if s.cookie:
+            login = (f'        add_header Set-Cookie "{COOKIE}={s.cookie}; Path=/; HttpOnly; Secure; SameSite=Lax; '
+                     'Max-Age=2592000" always;\n        return 302 /;\n')
+            locs += f"    location = /{s.cookie} {{\n{login}    }}\n    location = /{s.cookie}/ {{\n{login}    }}\n"
+        locs += "".join(_nginx_location(r.prefix, r.upstream, r.strip, auth, exact=r.exact) for r in s.routes)
         for prefix, url in s.redirects:
             locs += f"    location {prefix.rstrip('/')} {{\n{auth}        return 302 {url};\n    }}\n"
         locs += _nginx_location("/", s.upstream, False, auth, html_up=s.html_upstream)
@@ -205,58 +207,69 @@ def rebuild_script(kind: str, groups: list[tuple[str, list[Site]]], email: str |
 
 
 # ------------------------------------------------------------------ готовые наборы сайтов
-def panel_sites(p: db.Panel, cookie: str | None = None, link_extractor: bool | None = None) -> list[Site]:
+def panel_sites(p: db.Panel, cookie: str | None = None, link_extractor: bool | None = None,
+                ct: dict | None = None) -> list[Site]:
+    """Панель (+секретный путь) и домен подписки (через Link Extractor, если он стоит)."""
+    ct = ct or {}
     le = p.link_extractor if link_extractor is None else link_extractor
-    sub_here = bool(p.sub_domain and p.sub_local)
-    site = Site(p.domain, "remnawave:3000", cookie=cookie)
-    if le:
-        site.html_upstream = LE_UP  # экстрактор встраивает пункт меню в панель
-        if sub_here:  # экстрактор — на домене подписки
-            site.routes = [Route("/link-extractor/inject.js", LE_UP, exact=True)]
-            site.redirects = [("/link-extractor", f"https://{p.sub_domain}/link-extractor/")]
-        else:
-            site.routes = [Route("/link-extractor/", LE_UP)]
-    sites = [site]
-    if sub_here:
-        sites.append(Site(p.sub_domain, LE_UP if le else "remnawave-subscription-page:3010"))
+    sites = [Site(p.domain, f"{ct.get('panel', 'remnawave')}:3000", cookie=cookie)]
+    if p.sub_domain and p.sub_local:
+        up = f"{ct.get('le', 'link-extractor')}:3020" if le else f"{ct.get('subpage', 'remnawave-subscription-page')}:3010"
+        sites.append(Site(p.sub_domain, up))
     return sites
 
 
 def panel_cookie(p: db.Panel) -> str | None:
+    """Ключ секретного пути (X-Api-Key) или None."""
     return crypto.dec(p.cookie_enc) if p.protected else None
 
 
-def bedolaga_sites(hooks_domain: str) -> list[Site]:
-    return [Site(hooks_domain, "remnawave_bot:8080")]
+def login_url(domain: str, key: str | None) -> str:
+    return f"https://{domain}/{key}" if key else f"https://{domain}"
 
 
-def cabinet_sites(cabinet_domain: str, api_upstream: str) -> list[Site]:
-    return [Site(cabinet_domain, "cabinet_frontend:80", [Route("/api/", api_upstream, strip=True)])]
+def bedolaga_sites(hooks_domain: str, bot_ct: str = "remnawave_bot") -> list[Site]:
+    return [Site(hooks_domain, f"{bot_ct}:8080")]
+
+
+def cabinet_sites(cabinet_domain: str, api_upstream: str, front_ct: str = "cabinet_frontend") -> list[Site]:
+    return [Site(cabinet_domain, f"{front_ct}:80", [Route("/api/", api_upstream, strip=True)])]
+
+
+async def containers(server: db.Server) -> dict:
+    """Имена контейнеров на сервере (из последнего обнаружения): panel, subpage, le, bot, cabinet."""
+    import json
+    raw = await db.setting(f"ct:{server.id}")
+    return json.loads(raw) if raw else {}
 
 
 async def server_groups(server: db.Server, cookie_override: dict | None = None) -> list[tuple[str, list[Site]]]:
     """Все сайты, которые прокси этого сервера должен обслуживать: панели, боты Bedolaga, кабинеты."""
+    ct = await containers(server)
+    bot_ct = ct.get("bot", "remnawave_bot")
     groups = []
     for p in await db.all_(db.Panel, db.Panel.server_id == server.id):
         cookie = (cookie_override or {}).get(p.id, panel_cookie(p))
-        groups.append((sname("panel", p.id), panel_sites(p, cookie)))
+        groups.append((sname("panel", p.id), panel_sites(p, cookie, ct=ct)))
     for b in await db.all_(db.Bedolaga):
         if b.server_id == server.id and b.hooks_domain:
-            groups.append((sname("bedolaga", b.id), bedolaga_sites(b.hooks_domain)))
+            groups.append((sname("bedolaga", b.id), bedolaga_sites(b.hooks_domain, bot_ct)))
         if b.cabinet and b.cabinet_domain:
             cab_srv = int(await db.setting(f"cabinet_srv:{b.id}") or b.server_id or 0)
             if cab_srv == server.id:
-                api = "remnawave_bot:8080" if cab_srv == b.server_id else f"https://{b.hooks_domain}"
-                groups.append((sname("cabinet", b.id), cabinet_sites(b.cabinet_domain, api)))
+                api = f"{bot_ct}:8080" if cab_srv == b.server_id else f"https://{b.hooks_domain}"
+                groups.append((sname("cabinet", b.id),
+                               cabinet_sites(b.cabinet_domain, api, ct.get("cabinet", "cabinet_frontend"))))
     return groups
 
 
+# ------------------------------------------------------------------ подключение существующей панели
 def takeover_script(kind: str, groups: list[tuple[str, list[Site]]],
                     check_domain: str, cookie: str | None, email: str | None = None) -> str:
     """Бэкапит и останавливает текущий прокси (80/443), ставит наш со всеми сайтами сервера,
     проверяет панель, при ошибке — откат."""
     applies = "(\n" + rebuild_fragment(kind, groups, email) + "\n)"
-    cookie_hdr = f'-H "Cookie: vmkey={cookie}"' if cookie else ""
+    cookie_hdr = f'-H "X-Api-Key: {cookie}"' if cookie else ""
     return scripts.PRELUDE + f"""
 need_docker
 : > /tmp/vm_moved
@@ -316,10 +329,10 @@ def kind_of(server: db.Server | None) -> str:
 
 
 def bedolaga_auth_env(cookie: str | None) -> dict:
-    """Переменные Bedolaga для панели за секретным путём.
-    AUTH_TYPE=caddy → Bearer = API-ключ, X-Api-Key = CADDY_TOKEN; плюс cookie vmkey через SECRET_KEY."""
+    """Bedolaga за секретным путём: AUTH_TYPE=caddy →
+    Authorization: Bearer <API-ключ панели>, X-Api-Key: <ключ секретного пути>."""
     if cookie:
-        return {"REMNAWAVE_AUTH_TYPE": "caddy", "REMNAWAVE_CADDY_TOKEN": cookie, "REMNAWAVE_SECRET_KEY": f"vmkey:{cookie}"}
+        return {"REMNAWAVE_AUTH_TYPE": "caddy", "REMNAWAVE_CADDY_TOKEN": cookie, "REMNAWAVE_SECRET_KEY": ""}
     return {"REMNAWAVE_AUTH_TYPE": "api_key", "REMNAWAVE_CADDY_TOKEN": "", "REMNAWAVE_SECRET_KEY": ""}
 
 
@@ -330,4 +343,4 @@ async def sync_bedolaga_token(bot, chat_id: int, panel: db.Panel) -> None:
     for b in await db.all_(db.Bedolaga, db.Bedolaga.panel_id == panel.id):
         srv = await db.get(db.Server, b.server_id)
         if srv:
-            await run_task(bot, chat_id, srv, f"Bedolaga {b.name}: доступ к панели", scripts.bedolaga_env(b.compose_file, env))
+            await run_task(bot, chat_id, srv, f"Bedolaga {b.name}: доступ к панели", scripts.bedolaga_env(b.compose_file, env, b.install_dir))

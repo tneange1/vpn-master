@@ -44,8 +44,8 @@ async def lx_main(c: CallbackQuery):
     conf = le_api.conf_of(await le_api.mod_for(p.id), p)
     if not conf:
         srv = await db.get(db.Server, p.server_id)
-        note = ("Прокси панели ведёт бот — маршруты подписки и /link-extractor/ пропишу сам."
-                if p.managed_proxy else "Прокси не от бота — install.sh экстрактора сам допишет Caddy/nginx.")
+        note = ("Прокси ведёт бот — домен подписки направлю в экстрактор сам."
+                if p.managed_proxy else "Прокси не от бота — после установки нажми «🩹 Фикс reverse proxy» в карточке панели.")
         return await show(c, "🔗 <b>Link Extractor</b> · " + h(p.name) + "\n\n"
                              "Ставится на сервер панели (нужны контейнеры remnawave и remnawave-subscription-page). "
                              "Отдельный бот не нужен: всё управление здесь, уведомления экстрактора придут сюда.\n\n"
@@ -82,36 +82,27 @@ async def lx_main(c: CallbackQuery):
         [("💾 Бэкапы", f"lx:bk:{pid}"), ("⚙️ Настройки", f"lx:set:{pid}")],
         [("🔄 Обновить все подписки", f"lx:ref:{pid}")],
         [("⬆️ Обновить экстрактор", f"lx:upd:{pid}"), ("⬆️ Обновить Remnawave", f"lx:updrw:{pid}")],
-        [("🧭 Починить меню в панели и маршруты", f"lx:fix:{pid}")],
+        [("🩹 Фикс маршрутов (экстрактор на домене подписки)", f"lx:fix:{pid}")],
         [("🗑 Убрать", f"lx:rm:{pid}"), ("⬅️ Модификации", f"mod:p:{pid}")]))
 
 
 @router.callback_query(F.data.startswith("lx:fix:"))
 async def lx_fix(c: CallbackQuery, bot: Bot):
-    """Пункт «Экстрактор ссылок» в меню панели + экстрактор на домене подписки."""
+    """Экстрактор — только на домене подписки: чиним прокси сервера панели."""
+    from ..discover import fix_proxy
     p = await db.get(db.Panel, _p(c.data))
     server = await db.get(db.Server, p.server_id)
-    await c.answer()
-    notes = []
-    try:
-        async with await le_api.for_panel(p.id) as le:
-            await le.call("POST", "/settings", {"panelDomain": p.domain})
-        notes.append(f"✅ Экстрактору указан домен панели {h(p.domain)} — он встроит пункт в меню")
-    except LeError as e:
-        notes.append(f"⚠️ Экстрактор: {h(e)}")
-    if p.managed_proxy and server:
-        p.link_extractor = True
-        p = await db.save(p)
-        res = await run_task(bot, c.message.chat.id, server, "Маршруты прокси для Link Extractor",
-                             proxy.apply_script(proxy.kind_of(server), proxy.sname("panel", p.id),
-                                                proxy.panel_sites(p, proxy.panel_cookie(p))))
-        notes.append(("✅" if res.ok else "❌") + " Прокси: страницы панели идут через экстрактор (меню), "
-                     + (f"/link-extractor → https://{h(p.sub_domain)}/link-extractor/" if p.sub_domain and p.sub_local
-                        else "/link-extractor/ → экстрактор"))
-    else:
-        notes.append("⚠️ Прокси этой панели ставил не бот — маршруты не трогаю. "
-                     "Отдай прокси боту: карточка панели → 🧭 Reverse proxy.")
-    await say(c, "\n".join(notes) + "\n\nОбнови страницу панели (Ctrl+F5).", kb([("⬅️ Экстрактор", f"lx:v:{p.id}")]))
+    if not server:
+        return await c.answer("У панели нет SSH-сервера", show_alert=True)
+    await c.answer("Чиню прокси…")
+    await fix_proxy(bot, c.message.chat.id, server)
+    p = await db.get(db.Panel, p.id)
+    if p.sub_domain and p.sub_local:
+        m = await le_api.mod_for(p.id)
+        conf = le_api.conf_of(m, p)
+        if conf:
+            await le_api.save_conf(p, le_api.default_url(p), conf["token"], server.id)
+    await say(c, f"🔗 Экстрактор: https://{h(p.sub_domain or '—')}/link-extractor/", kb([("⬅️ Экстрактор", f"lx:v:{p.id}")]))
 
 
 # ================================================================== установка / подключение
@@ -141,21 +132,18 @@ async def lx_install_go(c: CallbackQuery, bot: Bot):
         return await say(c, f"❌ Нужен API-токен панели: <code>{h(e)}</code>", kb([("🔑 Доступ к API", f"pn:api:{p.id}")]))
     res = await run_task(bot, c.message.chat.id, server, "Установка Link Extractor", scripts.link_extractor_install(
         panel_name=p.name, panel_domain=p.domain, sub_domain=p.sub_domain if p.sub_local else None,
-        rw_token=rw_token, tg_token=config.BOT_TOKEN, tg_chat=config.OWNER_ID, proxy_auto=not p.managed_proxy))
+        rw_token=rw_token, tg_token=config.BOT_TOKEN, tg_chat=config.OWNER_ID, proxy_auto=False))
     m = re.search(r"url=(\S*) token=(\S*)", res.marks.get("LE_RESULT", ""))
     if not (res.ok and m and m.group(2)):
         return await say(c, "❌ Установка не удалась — лог выше.", kb([("🔁 Ещё раз", f"lx:instgo:{p.id}"), ("⬅️ Назад", f"lx:v:{p.id}")]))
-    await le_api.save_conf(p, m.group(1) or le_api.default_url(p), m.group(2), server.id)
-    if p.managed_proxy:
-        p.link_extractor = True
-        p = await db.save(p)
-        await run_task(bot, c.message.chat.id, server, "Маршруты прокси для Link Extractor",
-                       proxy.apply_script(proxy.kind_of(server), proxy.sname("panel", p.id),
-                                          proxy.panel_sites(p, proxy.panel_cookie(p))))
+    await le_api.save_conf(p, le_api.default_url(p), m.group(2), server.id)
+    p.link_extractor = True
+    p = await db.save(p)
+    from ..discover import fix_proxy
+    await fix_proxy(bot, c.message.chat.id, server)  # домен подписки → экстрактор
     try:
         async with await le_api.for_panel(p.id) as le:
             await le.call("GET", "/info", timeout=20)
-            await le.call("POST", "/settings", {"panelDomain": p.domain})  # пункт «Экстрактор ссылок» в меню панели
         ok = "✅ отвечает"
     except LeError as e:
         ok = f"⚠️ пока не отвечает ({h(e)}) — проверь DNS/прокси"

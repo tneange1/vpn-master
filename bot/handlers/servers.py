@@ -198,6 +198,7 @@ async def srv_view(c: CallbackQuery):
         [("💻 Терминал", f"srv:term:{i}"), ("⌨️ Команда", f"srv:cmd:{i}")],
         [("👁 Показать пароль", f"srv:pw:{i}"), ("✏️ Сменить пароль", f"srv:setpw:{i}")],
         [("🔁 Способ входа", f"srv:auth:{i}"), ("🛡 Безопасность", f"sec:s:{i}")],
+        [("🩹 Фикс reverse proxy", f"srv:fix:{i}"), ("🤖 Bedolaga", f"srv:bd:{i}")],
         [("🧹 Обслуживание", f"srv:mnt:{i}"), ("🔄 Перезагрузить", f"srv:rb:{i}")],
         [("♻️ Сбросить host key", f"srv:hk:{i}"), ("🗑 Удалить из бота", f"srv:del:{i}")],
         [("⬅️ Серверы", "srv:list")]))
@@ -216,7 +217,7 @@ async def srv_maint(c: CallbackQuery):
     await show(c, "🧹 <b>Обслуживание</b>",
                kb([("⬆️ Обновить пакеты (apt upgrade)", f"srv:apt:{i}")],
                   [("🐳 Почистить Docker (старше 7 дней)", f"srv:prune:{i}")],
-                  [("🩹 Починить сети прокси (502)", f"srv:nets:{i}")],
+                  [("🩹 Фикс reverse proxy (в т.ч. 502)", f"srv:fix:{i}")],
                   [("⬅️ К серверу", f"srv:v:{i}")]))
 
 
@@ -412,9 +413,10 @@ async def acc_panels(c: CallbackQuery):
 async def acc_panel(c: CallbackQuery, bot: Bot):
     p = await db.get(db.Panel, c.data.split(":")[2])
     cookie = crypto.dec(p.cookie_enc) if p.protected else None
-    login_url = f"https://{p.domain}/?vmkey={cookie}" if cookie else f"https://{p.domain}"
+    login_url = f"https://{p.domain}/{cookie}" if cookie else f"https://{p.domain}"
     text = (f"🖥 <b>{h(p.name)}</b>\n"
-            f"Вход: {h(login_url)}\n"
+            f"Вход: <tg-spoiler>{h(login_url)}</tg-spoiler>\n"
+            + (f"X-Api-Key: <tg-spoiler><code>{h(cookie)}</code></tg-spoiler>\n" if cookie else "") +
             f"Логин: <code>{h(p.admin_user or '—')}</code>\n"
             f"Пароль: <tg-spoiler><code>{h(crypto.dec(p.admin_pass_enc) or '—')}</code></tg-spoiler>\n"
             f"API: <code>{h(p.api_url)}</code>\n"

@@ -229,8 +229,9 @@ async def rwx_go(c: CallbackQuery):
     await db.save(server)
     p.managed_proxy = True
     p.protected, p.cookie_enc = bool(cookie), crypto.enc(cookie) if cookie else None
-    await db.save(p)
+    p = await db.save(p)
     await db.set_setting(f"rwx:{p.id}", None)
+    await proxy.sync_bedolaga_token(c.bot, c.message.chat.id, p)
     await say(c, f"✅ Прокси {kind.capitalize()} настроен.\n"
                  f"Вход в панель: <tg-spoiler>{h(_login_url(p.domain, cookie))}</tg-spoiler>\n"
                  f"Бэкап старого прокси: <code>{h(res.marks.get('BACKUP', '—'))}</code>",
@@ -283,7 +284,7 @@ async def inst_bb_done(event, values, ctx):
         bot_token=values["token"], admin_ids=values["admins"], hooks_domain=values["hooks"],
         rw_url="http://remnawave:3000" if local else panel.api_url, rw_key=rw_token, local=local,
         web_api_token=web_token, webhook_secret=secrets.token_hex(32), pg_pass=secrets.token_hex(16),
-        rw_cookie=proxy.panel_cookie(panel) if not local else None)
+        rw_cookie=proxy.panel_cookie(panel))
     b = await db.save(db.Bedolaga(name=values["name"], server_id=server.id, panel_id=panel.id,
                                   bot_token_enc=crypto.enc(values["token"]), admin_ids=values["admins"],
                                   hooks_domain=values["hooks"], web_api_token_enc=crypto.enc(web_token)))

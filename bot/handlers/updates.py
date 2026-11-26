@@ -50,6 +50,8 @@ async def upd_bot(c: CallbackQuery):
     rows = [[("🤖 Bedolaga Bot", f"upd:run:bedolaga:{b.id}")]]
     if b.cabinet:
         rows.append([("🗂 Кабинет", f"upd:run:cabinet:{b.id}")])
+        cab_srv = await db.setting(f"cabinet_srv:{b.id}") or b.server_id
+        rows.append([("🩹 Кабинет отдаёт 502 — починить сети прокси", f"srv:nets:{cab_srv}")])
     rows.append([("⬅️ Обновления", "upd")])
     await show(c, f"⬆️ <b>{h(b.name)}</b>", kb(*rows))
 
@@ -64,7 +66,8 @@ async def _target(kind: str, obj_id: str):
         srv_id = b.server_id
         if kind == "cabinet":
             srv_id = await db.setting(f"cabinet_srv:{b.id}") or b.server_id
-        script = scripts.bedolaga_update(b.compose_file) if kind == "bedolaga" else scripts.UPDATES["cabinet"]
+        script = scripts.bedolaga_update(b.compose_file) if kind == "bedolaga" \
+            else scripts.UPDATES["cabinet"] + scripts.FIX_PROXY_NETS.split("\n", 1)[1]
         return await db.get(db.Server, srv_id), script, f"{LABEL[kind]} {b.name}"
     s = await db.get(db.Server, obj_id)  # panel/subpage/caddy/link_extractor/backup_restore — по id сервера
     return s, scripts.UPDATES[kind], LABEL[kind]

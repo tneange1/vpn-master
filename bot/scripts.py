@@ -29,9 +29,18 @@ get_env(){ grep -E "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/
 
 # ---- reverse proxy: Caddy (/opt/remnawave/caddy) или Nginx (/opt/remnawave/nginx), сайты — отдельными файлами
 # Что перенесли/остановили — пишем в /tmp/vm_moved, чтобы уметь откатиться.
-proxy_networks(){ # контейнер прокси
-  for n in remnawave-network BEDOLAGANET; do
-    if docker network inspect "$n" >/dev/null 2>&1; then docker network connect "$n" "$1" 2>/dev/null || true; fi
+proxy_networks(){ # контейнер прокси: подключаем ко всем сетям панели/бота/кабинета/экстрактора
+  local px="$1" n c
+  running "$px" || return 0
+  for n in remnawave-network BEDOLAGANET bedolaga-cabinet_default; do
+    if docker network inspect "$n" >/dev/null 2>&1; then docker network connect "$n" "$px" 2>/dev/null || true; fi
+  done
+  for c in remnawave remnawave-subscription-page remnawave_bot cabinet_frontend link-extractor; do
+    running "$c" || continue
+    for n in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c"); do
+      case "$n" in host|none|bridge) continue;; esac
+      docker network connect "$n" "$px" 2>/dev/null || true
+    done
   done
 }
 running(){ docker ps --format '{{.Names}}' | grep -qx "$1"; }
@@ -179,8 +188,8 @@ nginx_site(){ # имя "домены через пробел"; содержим�
   log "Сертификат $name: $domains"
   if [ -n "${VM_EMAIL:-}" ]; then mail="--email $VM_EMAIL"; else mail="--register-unsafely-without-email"; fi
   # shellcheck disable=SC2086
-  (cd CERTBOTDIR && docker compose run --rm certbot certonly --webroot -w /var/www/certbot \
-     --non-interactive --agree-tos $mail --cert-name "$name" --expand $args) || { echo "!! certbot не выдал сертификат"; return 4; }
+  (cd CERTBOTDIR && docker compose run --rm -T certbot certonly --webroot -w /var/www/certbot \
+     --non-interactive --agree-tos $mail --cert-name "$name" --expand $args </dev/null) || { echo "!! certbot не выдал сертификат"; return 4; }
   printf '%s\n' "$content" > "NGINXDIR/conf.d/$name.conf"
   proxy_networks nginx
   if ! docker exec nginx nginx -t; then
@@ -324,8 +333,8 @@ if ss -ltnH 2>/dev/null | awk '{{print $4}}' | grep -qE '(^|:)80$'; then
   echo "!! Порт 80 занят — certbot --standalone не сможет пройти проверку:"; ss -ltnp | grep -E ':80\\b' || true; exit 4
 fi
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow 80/tcp >/dev/null; fi
-docker compose run --rm certbot certonly --standalone --non-interactive --agree-tos {mail} \\
-  --cert-name key {'--expand ' if expand else ''}{ds}
+docker compose run --rm -T certbot certonly --standalone --non-interactive --agree-tos {mail} \\
+  --cert-name key {'--expand ' if expand else ''}{ds} </dev/null
 ls -l {CERTBOT_DIR}/certs/live/key/
 """
 
@@ -419,13 +428,13 @@ docker restart remnanode >/dev/null && log "remnanode перезапущен"
 
 
 CERT_RENEW = _script(f"""
-cd {CERTBOT_DIR} && docker compose run --rm certbot renew
+cd {CERTBOT_DIR} && docker compose run --rm -T certbot renew </dev/null
 docker exec nginx-selfsteal nginx -s reload 2>/dev/null || true
 docker restart remnanode >/dev/null && log "remnanode перезапущен"
 """)
-CERT_DRYRUN = _script(f"cd {CERTBOT_DIR} && docker compose run --rm certbot renew --dry-run")
+CERT_DRYRUN = _script(f"cd {CERTBOT_DIR} && docker compose run --rm -T certbot renew --dry-run </dev/null")
 CERT_STATUS = _script(f"""
-cd {CERTBOT_DIR} 2>/dev/null && docker compose run --rm certbot certificates || echo "certbot не установлен"
+cd {CERTBOT_DIR} 2>/dev/null && docker compose run --rm -T certbot certificates </dev/null || echo "certbot не установлен"
 cat /etc/cron.d/vpn-master-certbot 2>/dev/null || echo "крон автопродления не найден"
 """)
 NODE_CHECK = _script("""
@@ -449,8 +458,8 @@ def bedolaga_install(*, bot_token: str, admin_ids: str, hooks_domain: str, rw_ur
         "REMNAWAVE_API_URL": rw_url, "REMNAWAVE_API_KEY": rw_key, "REMNAWAVE_AUTH_TYPE": "api_key",
         "POSTGRES_DB": "remnawave_bot", "POSTGRES_USER": "remnawave_user", "POSTGRES_PASSWORD": pg_pass,
     }
-    if rw_cookie:
-        env["REMNAWAVE_SECRET_KEY"] = f"vmkey:{rw_cookie}"
+    if rw_cookie:  # секретный путь панели: бот шлёт его в X-Api-Key
+        env["REMNAWAVE_CADDY_TOKEN"] = rw_cookie
     sets = "\n".join(f"set_env .env {k} {q(v)}" for k, v in env.items())
     return _script(f"""
 need_docker
@@ -509,22 +518,29 @@ docker ps --format 'table {{{{.Names}}}}\\t{{{{.Status}}}}' | grep -i cabinet ||
 
 
 # ===================================================================== Модификации
-def link_extractor_install(bot_token: str, admin_ids: str) -> str:
+def link_extractor_install(*, panel_name: str, panel_domain: str, sub_domain: str | None, rw_token: str,
+                           tg_token: str, tg_chat: int, proxy_auto: bool) -> str:
+    """Только экстрактор (без отдельного бота) через его install.sh. Управление — из vpn-master,
+    уведомления экстрактора идут через нашего бота владельцу."""
+    args = ["--mode", "extractor", "--yes", "--panel-name", panel_name, "--auto-update", "1",
+            "--proxy", "auto" if proxy_auto else "none", "--tg-token", tg_token, "--tg-chat", str(tg_chat),
+            "--api-token", rw_token, "--panel-domain", panel_domain]
+    if sub_domain:
+        args += ["--sub-domain", sub_domain]
     return _script(f"""
 need_docker
-pkg git
-D=/opt/link-extractor
-if [ -d "$D/.git" ]; then cd "$D" && git pull --ff-only || true
-else git clone https://github.com/tneange1/link-extractor "$D"; cd "$D"; fi
-[ -f .env ] || cp .env.example .env
-set_env .env COMPOSE_PROFILES extractor,bot
-set_env .env TG_BOT_TOKEN {q(bot_token)}
-set_env .env TG_ADMIN_IDS {q(admin_ids)}
-mkdir -p data/bot && chown -R 1000:1000 data
-docker compose up -d --build
-sleep 8
-S=$(docker exec link-extractor node -e 'try{{console.log(JSON.stringify(require("/app/data/store.json").secrets))}}catch(e){{}}' 2>/dev/null || true)
-[ -n "$S" ] && mark LE_SECRETS "$S"
+curl -fsSL https://raw.githubusercontent.com/tneange1/link-extractor/main/install.sh -o /tmp/le-install.sh
+# LE_RESULT содержит API-токен — превращаем в скрытый маркер
+bash /tmp/le-install.sh {" ".join(q(a) for a in args)} </dev/null 2>&1 | sed -E 's/^LE_RESULT (.*)$/##VM LE_RESULT=\\1/; s/^LE_ERROR (.*)$/!! \\1/'
+rm -f /tmp/le-install.sh
+cd /opt/link-extractor
+# отдельный бот экстрактора не нужен — всё в vpn-master
+sed -i 's/^COMPOSE_PROFILES=.*/COMPOSE_PROFILES=extractor/' .env
+set_env .env TG_BOT_TOKEN {q(tg_token)}
+set_env .env TG_ADMIN_IDS {q(str(tg_chat))}
+docker rm -f link-extractor-bot >/dev/null 2>&1 || true
+docker compose up -d --remove-orphans >/dev/null 2>&1 || docker compose up -d
+log "Link Extractor работает без отдельного бота"
 docker ps --format 'table {{{{.Names}}}}\\t{{{{.Status}}}}' | grep -i link || true
 """)
 
@@ -812,6 +828,26 @@ git pull --ff-only
 docker compose -f {q(compose_file)} up -d --build
 docker image prune -f >/dev/null || true
 docker compose -f {q(compose_file)} ps
+""")
+
+
+def bedolaga_env(compose_file: str, env: dict) -> str:
+    """Поменять переменные .env Bedolaga и перезапустить бота. Значение None — удалить переменную."""
+    lines = []
+    for k, v in env.items():
+        lines.append(f"sed -i '/^{k}=/d' .env" if v is None else f"set_env .env {k} {q(v)}")
+    return _script(f"""
+cd {BEDOLAGA_DIR} || {{ echo "Bedolaga не найден"; exit 2; }}
+{chr(10).join(lines)}
+docker compose -f {q(compose_file)} up -d
+log "Bedolaga перезапущен с новыми настройками"
+""")
+
+
+FIX_PROXY_NETS = _script("""
+for px in caddy nginx; do
+  if running "$px"; then proxy_networks "$px"; log "$px подключён к сетям:"; docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$px"; fi
+done
 """)
 
 

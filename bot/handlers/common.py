@@ -163,7 +163,8 @@ async def bk_menu(c: CallbackQuery):
 
 
 async def send_backup(bot: Bot) -> None:
-    path = await backup.make()
+    from .linkext import backup_all
+    path = await backup.make(await backup_all())
     await bot.send_document(config.OWNER_ID, FSInputFile(path),
                             caption=f"💾 Бэкап vpn-master · {path.stat().st_size // 1024} КБ\n"
                                     "Внутри ключ шифрования — не пересылай.")

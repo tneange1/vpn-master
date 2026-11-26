@@ -62,8 +62,9 @@ async def panel_view(c: CallbackQuery):
     await show(c, text, kb(
         [("🛰 Ноды", f"pn:nodes:{i}"), ("🌐 Хосты", f"hs:list:{i}:0")],
         [("🧬 Профили", f"pn:prof:{i}"), ("👥 Сквады", f"pn:sq:{i}")],
-        [("🧩 Модификации", f"mod:p:{i}"), ("⬆️ Обновления", f"upd:p:{i}")],
+        [("🔗 Link Extractor", f"lx:v:{i}"), ("🧩 Модификации", f"mod:p:{i}")],
         [("🔑 Доступ к API", f"pn:api:{i}"), ("🖥 Сервер панели", f"pn:srv:{i}")],
+        [("⬆️ Обновления", f"upd:p:{i}")],
         [("🗑 Убрать из бота", f"pn:del:{i}")],
         [("⬅️ Панели", "pn:list")]))
 

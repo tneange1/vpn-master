@@ -308,8 +308,10 @@ async def sec_panel_toggle(c: CallbackQuery, bot: Bot):
                          proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, cookie)))
     if res.ok:
         p.protected, p.cookie_enc = on, crypto.enc(cookie) if cookie else None
-        await db.save(p)
+        p = await db.save(p)
+        await proxy.sync_bedolaga_token(bot, c.message.chat.id, p)
         msg = (f"✅ Включено. Вход: <tg-spoiler>https://{h(p.domain)}/?vmkey={h(cookie)}</tg-spoiler>\n"
-               "Bedolaga на другом сервере: передай ему ключ (переустанови бота или пропиши REMNAWAVE_SECRET_KEY).") \
+               "API-клиенты проходят с заголовком <code>X-Api-Key</code> = этот ключ; "
+               "ботам Bedolaga панели он прописан в REMNAWAVE_CADDY_TOKEN.") \
             if on else "✅ Защита выключена."
         await say(c, msg, kb([("⬅️ Назад", f"sec:p:{p.id}")]))

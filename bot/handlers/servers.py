@@ -216,7 +216,15 @@ async def srv_maint(c: CallbackQuery):
     await show(c, "🧹 <b>Обслуживание</b>",
                kb([("⬆️ Обновить пакеты (apt upgrade)", f"srv:apt:{i}")],
                   [("🐳 Почистить Docker (старше 7 дней)", f"srv:prune:{i}")],
+                  [("🩹 Починить сети прокси (502)", f"srv:nets:{i}")],
                   [("⬅️ К серверу", f"srv:v:{i}")]))
+
+
+@router.callback_query(F.data.startswith("srv:nets:"))
+async def srv_nets(c: CallbackQuery, bot: Bot):
+    s = await db.get(db.Server, c.data.split(":")[2])
+    await c.answer()
+    await run_task(bot, c.message.chat.id, s, "Сети прокси", scripts.FIX_PROXY_NETS)
 
 
 @router.callback_query(F.data.startswith(("srv:apt:", "srv:prune:")))

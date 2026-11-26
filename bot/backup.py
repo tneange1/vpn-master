@@ -21,7 +21,7 @@ async def _run(*args: str) -> tuple[int, str]:
     return proc.returncode, out.decode(errors="replace")
 
 
-async def make() -> Path:
+async def make(extra: dict[str, bytes] | None = None) -> Path:
     tmp = Path(tempfile.mkdtemp(prefix="vmbak-"))
     dump = tmp / "dump.sql"
     code, out = await _run("pg_dump", "--clean", "--if-exists", "--no-owner", "--no-privileges",
@@ -35,6 +35,10 @@ async def make() -> Path:
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(dump, arcname="dump.sql")
         tar.add(crypto.key_path(), arcname="master.key")
+        for name, data in (extra or {}).items():  # бэкапы Link Extractor и т.п.
+            ti = tarfile.TarInfo(f"extractors/{name}")
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
         info = tarfile.TarInfo("VERSION")
         data = b"vpn-master-backup 1\n"
         info.size = len(data)

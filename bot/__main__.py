@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 from . import config, crypto, db, forms
-from .handlers import common, install, keys, mods, panels, security, servers, updates
+from .handlers import common, install, keys, linkext, mods, panels, security, servers, updates
 
 
 class OwnerOnly(BaseMiddleware):
@@ -41,7 +41,7 @@ async def main() -> None:
     dp.update.outer_middleware(OwnerOnly())
     # порядок важен: терминал и формы ловят текст раньше остальных
     dp.include_routers(common.router, forms.router, install.router, panels.router, mods.router,
-                       security.router, updates.router, servers.router, keys.router)
+                       security.router, updates.router, servers.router, keys.router, linkext.router)
     await bot.set_my_commands([BotCommand(command="menu", description="Главное меню"),
                                BotCommand(command="cancel", description="Отменить ввод"),
                                BotCommand(command="term", description="Терминал на сервере (открыть/закрыть)")])

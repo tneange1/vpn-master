@@ -46,7 +46,7 @@ def render_caddy(sites: list[Site]) -> str:
             lines += [f"@vmset query vmkey={c}",
                       f'header @vmset Set-Cookie "vmkey={c}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000"',
                       "redir @vmset / 302",
-                      f"@vmdeny not header Cookie *vmkey={c}*",
+                      f"@vmdeny {{\n\t\t\tnot header Cookie *vmkey={c}*\n\t\t\tnot header X-Api-Key {c}\n\t\t}}",
                       "abort @vmdeny"]
         for r in s.routes:
             m = r.prefix.rstrip("/") + "/*"
@@ -94,7 +94,10 @@ def render_nginx(cert_name: str, sites: list[Site]) -> str:
         head, auth = "", ""
         if s.cookie:
             c = s.cookie
-            head = f'map $http_cookie {var} {{ default 0; "~(^|;\\s*)vmkey={c}(;|$)" 1; }}\n'
+            cvar = f"$vm_c_{_ident(cert_name)}_{i}"
+            # cookie ИЛИ заголовок X-Api-Key (так ходят Bedolaga и API-клиенты)
+            head = (f'map $http_cookie {cvar} {{ default 0; "~(^|;\\s*)vmkey={c}(;|$)" 1; }}\n'
+                    f'map $http_x_api_key {var} {{ default {cvar}; "{c}" 1; }}\n')
             auth = (f'        if ($arg_vmkey = "{c}") {{\n'
                     f'            add_header Set-Cookie "vmkey={c}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000" always;\n'
                     "            return 302 /;\n        }\n"
@@ -213,3 +216,14 @@ fi
 
 def kind_of(server: db.Server | None) -> str:
     return server.proxy if server and server.proxy else "caddy"
+
+
+async def sync_bedolaga_token(bot, chat_id: int, panel: db.Panel) -> None:
+    """Всем ботам Bedolaga этой панели — актуальный REMNAWAVE_CADDY_TOKEN (секретный путь)."""
+    from .runner import run_task
+    cookie = panel_cookie(panel)
+    for b in await db.all_(db.Bedolaga, db.Bedolaga.panel_id == panel.id):
+        srv = await db.get(db.Server, b.server_id)
+        if srv:
+            await run_task(bot, chat_id, srv, f"Bedolaga {b.name}: REMNAWAVE_CADDY_TOKEN",
+                           scripts.bedolaga_env(b.compose_file, {"REMNAWAVE_CADDY_TOKEN": cookie}))

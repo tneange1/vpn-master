@@ -25,6 +25,8 @@ class RW:
         self.cache_key = f"{self.base}|{username}"
         headers = {"X-Forwarded-Proto": "https", "X-Forwarded-For": "127.0.0.1"}
         cookies = {cookie[0]: cookie[1]} if cookie else None
+        if cookie:  # секретный путь пропускает и по заголовку
+            headers["X-Api-Key"] = cookie[1]
         self.c = httpx.AsyncClient(base_url=self.base, headers=headers, cookies=cookies, timeout=30)
 
     async def login(self) -> str:

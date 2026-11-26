@@ -6,7 +6,7 @@ from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery
 
-from .. import crypto, db, proxy, scripts, terminal, xray
+from .. import crypto, db, le_api, scripts, terminal, xray
 from ..forms import Field, form, start_form
 from ..rw_api import RwError, for_panel
 from ..runner import run_task
@@ -30,19 +30,20 @@ async def mods_menu(c: CallbackQuery):
     panels = await db.all_(db.Panel)
     rows = [[(f"🖥 {p.name}", f"mod:p:{p.id}")] for p in panels] or [[("Панелей нет", "noop")]]
     rows.append([("⬅️ Назад", "mng")])
-    await show(c, "🧩 <b>Модификации</b>\n\nНа панель: 🔗 Link Extractor, 💾 Backup-Restore (у каждой панели свой бот).\n"
+    await show(c, "🧩 <b>Модификации</b>\n\nНа панель: 🔗 Link Extractor (управление прямо здесь), "
+                  "💾 Backup-Restore (свой бот для бэкапов).\n"
                   "На ноду: 🌐 WARP-native.\n\nВыбери панель:", kb(*rows))
 
 
 @router.callback_query(F.data.startswith("mod:p:"))
 async def mods_panel(c: CallbackQuery):
     p = await db.get(db.Panel, c.data.split(":")[2])
-    le = await _mod("link_extractor", panel_id=p.id)
+    le = le_api.conf_of(await le_api.mod_for(p.id), p)
     br = await _mod("backup_restore", panel_id=p.id)
     nodes = await db.all_(db.Node, db.Node.panel_id == p.id)
     i = p.id
     rows = [
-        [(f"🔗 Link Extractor {'✅' if le else '➕'}", f"le:v:{i}")],
+        [(f"🔗 Link Extractor {'✅' if le else '➕'}", f"lx:v:{i}")],
         [(f"💾 Backup-Restore {'✅' if br else '➕'}", f"br:v:{i}")],
     ]
     rows += [[(f"🌐 WARP · {n.name} {'✅' if n.warp else ''}", f"mod:n:{n.id}")] for n in nodes]
@@ -54,93 +55,6 @@ def _panel_server_required(p, server):
     if not server:
         return "У панели не привязан сервер с SSH — модификации ставятся по SSH."
     return None
-
-
-# ------------------------------------------------------------------ Link Extractor
-@router.callback_query(F.data.startswith("le:v:"))
-async def le_view(c: CallbackQuery):
-    p = await db.get(db.Panel, c.data.split(":")[2])
-    m = await _mod("link_extractor", panel_id=p.id)
-    i = p.id
-    if not m:
-        return await show(c, "🔗 <b>Link Extractor</b> (github.com/tneange1/link-extractor)\n\n"
-                             "Ставится на сервер панели вместе со своим Telegram-ботом. "
-                             "Нужен токен отдельного бота от @BotFather.\n"
-                             + ("Reverse proxy управляется ботом — маршруты пропишу сам." if p.managed_proxy else
-                                "⚠️ Reverse proxy ставил не vpn-master (подключи панель с настройкой прокси) — "
-                                "пока маршруты настрой сам "
-                                "(подписка → link-extractor:3020, /link-extractor/ → link-extractor:3020)."),
-                          kb([("➕ Установить", f"le:inst:{i}")], [("⬅️ Назад", f"mod:p:{i}")]))
-    await show(c, f"🔗 <b>Link Extractor · {h(p.name)}</b> ✅\nАдмины бота: <code>{h(m.admin_ids)}</code>\n"
-                  f"Страница: https://{h(p.domain)}/link-extractor/",
-               kb([("🔐 Пароль страницы и API_TOKEN", f"le:sec:{i}")],
-                  [("⬆️ Обновить", f"upd:run:link_extractor:{p.server_id}"), ("🔁 Переустановить", f"le:inst:{i}")],
-                  [("🗑 Остановить", f"le:rm:{i}")],
-                  [("⬅️ Назад", f"mod:p:{i}")]))
-
-
-@form("le_inst", "🔗 Установка Link Extractor", [
-    Field("token", "Токен отдельного бота для Link Extractor (сообщение удалю):", secret=True),
-    Field("admins", "Telegram ID админов этого бота через запятую:", "ids"),
-])
-async def le_inst_done(event, values, ctx):
-    p = await db.get(db.Panel, ctx["panel"])
-    server = await db.get(db.Server, p.server_id)
-    if err := _panel_server_required(p, server):
-        return await say(event, "❌ " + err)
-    res = await run_task(event.bot, chat_id(event), server, "Установка Link Extractor",
-                         scripts.link_extractor_install(values["token"], values["admins"]))
-    m = await _mod("link_extractor", panel_id=p.id) or db.Mod(kind="link_extractor", panel_id=p.id)
-    m.server_id, m.bot_token_enc, m.admin_ids = server.id, crypto.enc(values["token"]), values["admins"]
-    if res.marks.get("LE_SECRETS"):
-        m.secrets_enc = crypto.enc(res.marks["LE_SECRETS"])
-    await db.save(m)
-    if res.ok and p.managed_proxy:
-        p.link_extractor = True
-        await db.save(p)
-        await run_task(event.bot, chat_id(event), server, "Маршруты прокси для Link Extractor",
-                       proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, proxy.panel_cookie(p))))
-    await say(event, f"{'✅' if res.ok else '⚠️'} Link Extractor установлен. API-токен Remnawave задай в его боте "
-                     "(⚙️ Настройки).", kb([("🔐 Секреты", f"le:sec:{p.id}"), ("⬅️ Назад", f"mod:p:{p.id}")]))
-
-
-@router.callback_query(F.data.startswith("le:inst:"))
-async def le_inst(c: CallbackQuery, state: FSMContext):
-    await start_form(c, state, "le_inst", ctx={"panel": int(c.data.split(":")[2])})
-
-
-@router.callback_query(F.data.startswith("le:sec:"))
-async def le_secrets(c: CallbackQuery, bot: Bot):
-    p = await db.get(db.Panel, c.data.split(":")[2])
-    m = await _mod("link_extractor", panel_id=p.id)
-    server = await db.get(db.Server, p.server_id)
-    res = await run_task(bot, c.message.chat.id, server, "Секреты Link Extractor", scripts.LINK_EXTRACTOR_SECRETS)
-    raw = res.marks.get("LE_SECRETS") or (crypto.dec(m.secrets_enc) if m else None)
-    if res.marks.get("LE_SECRETS") and m:
-        m.secrets_enc = crypto.enc(res.marks["LE_SECRETS"])
-        await db.save(m)
-    try:
-        pretty = json.dumps(json.loads(raw), ensure_ascii=False, indent=1) if raw else "—"
-    except ValueError:
-        pretty = raw
-    await say(c, f"🔐 <b>Link Extractor</b>\n<tg-spoiler><code>{h(pretty)}</code></tg-spoiler>",
-              kb([("⬅️ Назад", f"le:v:{p.id}")]))
-
-
-@router.callback_query(F.data.startswith("le:rm:"))
-async def le_remove(c: CallbackQuery, bot: Bot):
-    p = await db.get(db.Panel, c.data.split(":")[2])
-    server = await db.get(db.Server, p.server_id)
-    await run_task(bot, c.message.chat.id, server, "Остановка Link Extractor", scripts.LINK_EXTRACTOR_REMOVE)
-    m = await _mod("link_extractor", panel_id=p.id)
-    if m:
-        await db.delete(m)
-    if p.link_extractor and p.managed_proxy:
-        p.link_extractor = False
-        await db.save(p)
-        await run_task(bot, c.message.chat.id, server, "Маршруты прокси",
-                       proxy.apply_script(proxy.kind_of(server), "panel", proxy.panel_sites(p, proxy.panel_cookie(p))))
-    await say(c, "🗑 Link Extractor остановлен.", kb([("⬅️ Назад", f"mod:p:{p.id}")]))
 
 
 # ------------------------------------------------------------------ Backup-Restore (distillium)

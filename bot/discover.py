@@ -163,8 +163,12 @@ async def fix_proxy(bot, chat_id: int, server: db.Server) -> bool:
         k = proxy.panel_cookie(p)
         lines.append(f"🖥 {h(p.domain)}: " + (f"вход <tg-spoiler>{h(proxy.login_url(p.domain, k))}</tg-spoiler>, "
                                                f"API — заголовок <code>X-Api-Key</code>" if k else "без секретного пути"))
-        if p.link_extractor and p.sub_domain and p.sub_local:
-            lines.append(f"🔗 Link Extractor: https://{h(p.sub_domain)}/link-extractor/")
+        if p.link_extractor:
+            from . import le_api
+            err = await le_api.set_panel_domain(p)
+            lines.append(f"🔗 Link Extractor: {h(le_api.page_url(p))}"
+                         + (" (пункт в меню панели)" if p.le_on_panel is not False else "")
+                         + (f" · ⚠️ {h(err)}" if err else ""))
     if res.marks.get("BACKUP"):
         lines.append(f"💾 Бэкап прежнего прокси: <code>{h(res.marks['BACKUP'])}</code>")
     await bot.send_message(chat_id, "\n".join(lines))

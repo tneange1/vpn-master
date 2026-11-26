@@ -32,6 +32,23 @@ def conf_of(mod: db.Mod | None, panel: db.Panel) -> dict:
     return {"url": url, "token": token} if token else {}
 
 
+def page_url(panel: db.Panel) -> str:
+    """Где открывать страницу экстрактора в браузере."""
+    if panel.le_on_panel is not False or not (panel.sub_domain and panel.sub_local):
+        return f"https://{panel.domain}/link-extractor/"
+    return f"https://{panel.sub_domain}/link-extractor/"
+
+
+async def set_panel_domain(panel: db.Panel) -> str | None:
+    """Экстрактору — домен панели (пункт меню, страница в панели) или пусто (страница на домене подписки)."""
+    try:
+        async with await for_panel(panel.id) as le:
+            await le.call("POST", "/settings", {"panelDomain": panel.domain if panel.le_on_panel is not False else ""})
+        return None
+    except LeError as e:
+        return str(e)
+
+
 def default_url(panel: db.Panel) -> str:
     host = panel.sub_domain if panel.sub_domain and panel.sub_local else panel.domain
     return f"https://{host}/link-extractor"

@@ -67,6 +67,7 @@ class Panel(Stamp, Base):
     cookie_enc: Mapped[str | None] = mapped_column(Text)
     link_extractor: Mapped[bool] = mapped_column(Boolean, default=False)
     sub_local: Mapped[bool] = mapped_column(Boolean, default=True)  # страница подписки на сервере панели
+    le_on_panel: Mapped[bool] = mapped_column(Boolean, default=True)  # страница экстрактора + пункт меню в панели
 
 
 class Node(Stamp, Base):
@@ -131,6 +132,7 @@ MIGRATIONS = [
     "ALTER TABLE ssh_keys ALTER COLUMN private_enc DROP NOT NULL",
     "ALTER TABLE servers ADD COLUMN IF NOT EXISTS proxy VARCHAR(16)",
     "ALTER TABLE panels ADD COLUMN IF NOT EXISTS sub_local BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE panels ADD COLUMN IF NOT EXISTS le_on_panel BOOLEAN DEFAULT TRUE",
 ]
 
 

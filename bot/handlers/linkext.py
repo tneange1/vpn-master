@@ -67,7 +67,8 @@ async def lx_main(c: CallbackQuery):
     all_g = next((g for g in groups if g.get("code") == "ALL"), None)
     sett = st.get("settings", {})
     stub = sett.get("stubInbound")
-    lines = [f"🔗 <b>Link Extractor · {h(p.name)}</b>", f"<code>{h(conf['url'])}</code>", "",
+    lines = [f"🔗 <b>Link Extractor · {h(p.name)}</b>", f"Страница: {h(le_api.page_url(p))}",
+             f"API: <code>{h(conf['url'])}</code>", "",
              f"📚 Источников: <b>{len(srcs)}</b> (подписок: {subs})" + (f" · ⚠️ с ошибками: {errs}" if errs else ""),
              f"🔑 Ключей в работе: <b>{all_g['count'] if all_g else st.get('activeCount', 0)}</b>",
              f"🌍 Группы: {'вкл, стран: ' + str(len([g for g in groups if g.get('code') != 'ALL'])) if sett.get('groupsEnabled') else 'выкл'}",
@@ -82,13 +83,22 @@ async def lx_main(c: CallbackQuery):
         [("💾 Бэкапы", f"lx:bk:{pid}"), ("⚙️ Настройки", f"lx:set:{pid}")],
         [("🔄 Обновить все подписки", f"lx:ref:{pid}")],
         [("⬆️ Обновить экстрактор", f"lx:upd:{pid}"), ("⬆️ Обновить Remnawave", f"lx:updrw:{pid}")],
-        [("🩹 Фикс маршрутов (экстрактор на домене подписки)", f"lx:fix:{pid}")],
+        [("📍 Страница: " + ("в панели (пункт меню)" if p.le_on_panel is not False else "только домен подписки"),
+          f"lx:mode:{pid}"), ("🩹 Фикс маршрутов", f"lx:fix:{pid}")],
         [("🗑 Убрать", f"lx:rm:{pid}"), ("⬅️ Модификации", f"mod:p:{pid}")]))
+
+
+@router.callback_query(F.data.startswith("lx:mode:"))
+async def lx_mode(c: CallbackQuery, bot: Bot):
+    p = await db.get(db.Panel, _p(c.data))
+    p.le_on_panel = p.le_on_panel is False
+    await db.save(p)
+    await lx_fix(c, bot)
 
 
 @router.callback_query(F.data.startswith("lx:fix:"))
 async def lx_fix(c: CallbackQuery, bot: Bot):
-    """Экстрактор — только на домене подписки: чиним прокси сервера панели."""
+    """Чиним прокси сервера панели (маршруты экстрактора) и домен панели в экстракторе."""
     from ..discover import fix_proxy
     p = await db.get(db.Panel, _p(c.data))
     server = await db.get(db.Server, p.server_id)
@@ -102,7 +112,7 @@ async def lx_fix(c: CallbackQuery, bot: Bot):
         conf = le_api.conf_of(m, p)
         if conf:
             await le_api.save_conf(p, le_api.default_url(p), conf["token"], server.id)
-    await say(c, f"🔗 Экстрактор: https://{h(p.sub_domain or '—')}/link-extractor/", kb([("⬅️ Экстрактор", f"lx:v:{p.id}")]))
+    await say(c, f"🔗 Экстрактор: {h(le_api.page_url(p))}", kb([("⬅️ Экстрактор", f"lx:v:{p.id}")]))
 
 
 # ================================================================== установка / подключение

@@ -4,7 +4,9 @@
   • браузер: https://панель/KEY — ставит cookie и пускает в панель;
   • API (Bedolaga, vpn-master и т.п.): заголовок X-Api-Key: KEY;
   • остальным соединение рвётся (Caddy: abort, Nginx: 444).
-Link Extractor живёт только на домене подписки, на домене панели его нет.
+Link Extractor: домен подписки → экстрактор (подписки и API). Если le_on_panel — как задумано в самом
+экстракторе: HTML панели идёт через него (он встраивает пункт «Экстрактор ссылок» в меню), а страница
+/link-extractor/ открывается на домене панели (за тем же секретным путём). Иначе на домене панели его нет.
 """
 import re
 from dataclasses import dataclass, field
@@ -212,7 +214,12 @@ def panel_sites(p: db.Panel, cookie: str | None = None, link_extractor: bool | N
     """Панель (+секретный путь) и домен подписки (через Link Extractor, если он стоит)."""
     ct = ct or {}
     le = p.link_extractor if link_extractor is None else link_extractor
-    sites = [Site(p.domain, f"{ct.get('panel', 'remnawave')}:3000", cookie=cookie)]
+    site = Site(p.domain, f"{ct.get('panel', 'remnawave')}:3000", cookie=cookie)
+    if le and p.le_on_panel is not False:
+        le_up = f"{ct.get('le', 'link-extractor')}:3020"
+        site.html_upstream = le_up  # экстрактор встраивает пункт меню в панель
+        site.routes = [Route("/link-extractor", le_up, exact=True), Route("/link-extractor/", le_up)]
+    sites = [site]
     if p.sub_domain and p.sub_local:
         up = f"{ct.get('le', 'link-extractor')}:3020" if le else f"{ct.get('subpage', 'remnawave-subscription-page')}:3010"
         sites.append(Site(p.sub_domain, up))

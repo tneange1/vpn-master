@@ -8,7 +8,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery
 from .. import crypto, db, scripts, ssh, terminal
 from ..forms import Field, form, start_form
 from ..runner import run_task
-from ..ui import chat_id, h, kb, say, show
+from ..ui import Card, chat_id, h, kb, say, show
 
 router = Router(name="servers")
 
@@ -172,6 +172,21 @@ async def srv_add(c: CallbackQuery, state: FSMContext):
     await start_form(c, state, "srv_add", preset={"server": "new"})
 
 
+async def _server_card(s: db.Server) -> Card:
+    key = await db.get(db.SshKey, s.key_id) if s.key_id else None
+    panels = await db.all_(db.Panel, db.Panel.server_id == s.id)
+    nodes = await db.all_(db.Node, db.Node.server_id == s.id)
+    bots = await db.all_(db.Bedolaga, db.Bedolaga.server_id == s.id)
+    roles = [f"панель {p.name}" for p in panels] + [f"нода {n.name}" for n in nodes] + [f"бот {b.name}" for b in bots]
+    return Card(f"🖥 {s.name}", [
+        ("IPv4", s.host, "code"), ("SSH", f"{s.username} · порт {s.port}", "code"),
+        ("Вход бота", AUTH_LABEL.get(s.auth, s.auth) + (f" · {key.name}" if key else "")),
+        ("Пароль", "сохранён" if s.password_enc else "—"),
+        ("Прокси", (s.proxy or "—").capitalize()), ("Host key", "запомнен" if s.host_key else "—"),
+        ("Роли", ", ".join(roles) or "—"),
+    ])
+
+
 async def _server_text(s: db.Server) -> str:
     key = await db.get(db.SshKey, s.key_id) if s.key_id else None
     panels = await db.all_(db.Panel, db.Panel.server_id == s.id)
@@ -193,7 +208,7 @@ async def srv_view(c: CallbackQuery):
     if not s:
         return await c.answer("Нет такого", show_alert=True)
     i = s.id
-    await show(c, await _server_text(s), kb(
+    await show(c, await _server_text(s), card=await _server_card(s), markup=kb(
         [("📊 Состояние", f"srv:state:{i}"), ("🔌 Проверить", f"srv:chk:{i}")],
         [("💻 Терминал", f"srv:term:{i}"), ("⌨️ Команда", f"srv:cmd:{i}")],
         [("👁 Показать пароль", f"srv:pw:{i}"), ("✏️ Сменить пароль", f"srv:setpw:{i}")],
@@ -266,7 +281,8 @@ async def srv_show_pw(c: CallbackQuery, bot: Bot):
     pw = crypto.dec(s.password_enc)
     if not pw:
         return await c.answer("Пароль не сохранён", show_alert=True)
-    m = await say(c, f"🔒 <b>{h(s.name)}</b>: <tg-spoiler><code>{h(pw)}</code></tg-spoiler>\n<i>Удалю через 60 сек.</i>")
+    await c.answer()
+    m = await c.message.answer(f"🔒 <b>{h(s.name)}</b>: <tg-spoiler><code>{h(pw)}</code></tg-spoiler>\n<i>Удалю через 60 сек.</i>")
     asyncio.create_task(_delete_later(bot, m.chat.id, m.message_id, 60))
 
 
@@ -392,7 +408,6 @@ async def srv_term(c: CallbackQuery, bot: Bot):
 async def srv_cmd_done(event, values, ctx):
     s = await db.get(db.Server, ctx["id"])
     await run_task(event.bot, chat_id(event), s, values["cmd"][:60], scripts.custom(values["cmd"]), timeout=600)
-    await say(event, "—", kb([("⌨️ Ещё команда", f"srv:cmd:{s.id}"), ("⬅️ К серверу", f"srv:v:{s.id}")]))
 
 
 @router.callback_query(F.data.startswith("srv:cmd:"))

@@ -10,7 +10,7 @@ import re
 
 from . import crypto, db, proxy, scripts
 from .runner import run_task
-from .ui import h
+from .ui import h, post
 
 
 def _host(url: str | None) -> str | None:
@@ -131,12 +131,12 @@ async def fix_proxy(bot, chat_id: int, server: db.Server) -> bool:
     """🩹 Одна кнопка: обнаружить → подхватить → пересобрать прокси → синхронизировать Bedolaga."""
     info = await run_discover(bot, chat_id, server)
     if info is None:
-        await bot.send_message(chat_id, "❌ Не смог осмотреть сервер.")
+        await post(bot, chat_id, "❌ Не смог осмотреть сервер.")
         return False
     notes = await adopt(server, info)
     groups = await proxy.server_groups(server)
     if not groups:
-        await bot.send_message(chat_id, "\n".join(notes + ["", "Нечего проксировать: панели/бота/кабинета на сервере нет."]))
+        await post(bot, chat_id, "\n".join(notes + ["", "Нечего проксировать: панели/бота/кабинета на сервере нет."]))
         return False
     kind = server.proxy
     if not kind:
@@ -146,11 +146,11 @@ async def fix_proxy(bot, chat_id: int, server: db.Server) -> bool:
     check = panels[0].domain if panels else groups[0][1][0].domain
     key = proxy.panel_cookie(panels[0]) if panels else None
     site_list = "\n".join(f"• {x.domain} → {x.upstream}" + (" 🔒" if x.cookie else "") for _, ss in groups for x in ss)
-    await bot.send_message(chat_id, "\n".join(notes) + f"\n\n<b>Собираю {kind.capitalize()}:</b>\n{h(site_list)}")
+    await post(bot, chat_id, "\n".join(notes) + f"\n\n<b>Собираю {kind.capitalize()}:</b>\n{h(site_list)}")
     res = await run_task(bot, chat_id, server, f"🩹 Фикс reverse proxy ({kind})",
                          proxy.takeover_script(kind, groups, check, key, await db.setting("acme_email")))
     if not res.ok:
-        await bot.send_message(chat_id, "❌ Прокси не поднялся — прежний возвращён (лог выше).")
+        await post(bot, chat_id, "❌ Прокси не поднялся — прежний возвращён (лог выше).")
         return False
     server.proxy = kind
     await db.save(server)
@@ -171,5 +171,5 @@ async def fix_proxy(bot, chat_id: int, server: db.Server) -> bool:
                          + (f" · ⚠️ {h(err)}" if err else ""))
     if res.marks.get("BACKUP"):
         lines.append(f"💾 Бэкап прежнего прокси: <code>{h(res.marks['BACKUP'])}</code>")
-    await bot.send_message(chat_id, "\n".join(lines))
+    await post(bot, chat_id, "\n".join(lines))
     return True

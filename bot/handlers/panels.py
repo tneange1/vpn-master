@@ -11,7 +11,7 @@ from .. import crypto, db, scripts, xray
 from ..forms import Field, form, start_form
 from ..rw_api import RwError, for_panel, has_api
 from ..runner import run_task
-from ..ui import chat_id, h, kb, say, show
+from ..ui import Card, card_html, chat_id, h, kb, say, show
 from .servers import SERVER_FIELDS, ensure_server
 
 router = Router(name="panels")
@@ -52,15 +52,17 @@ async def panel_view(c: CallbackQuery):
     server = await db.get(db.Server, p.server_id)
     nodes = await db.all_(db.Node, db.Node.panel_id == p.id)
     i = p.id
-    text = (f"🖥 <b>{h(p.name)}</b>\n"
-            f"Панель: https://{h(p.domain)}\n"
-            f"Подписка: {('https://' + h(p.sub_domain)) if p.sub_domain else '—'}\n"
-            f"Сервер (SSH): {h(server.name + ' · ' + server.host) if server else '— не привязан'}\n"
-            f"Доступ к API: {_api_label(p)}\n"
-            f"Прокси: {(server.proxy or 'caddy').capitalize() + ' от vpn-master' if p.managed_proxy and server else 'не от бота'}"
-            f" · Секретный путь (X-Api-Key): {'🔒' if p.protected else 'выкл'}\n"
-            f"Нод в боте: {len(nodes)}")
-    await show(c, text, kb(
+    card = Card(f"🖥 {p.name}", [
+        ("Панель", f"https://{p.domain}"),
+        ("Подписка", f"https://{p.sub_domain}" if p.sub_domain else "—"),
+        ("Сервер", f"{server.name} · {server.host}" if server else "не привязан"),
+        ("Доступ к API", _api_label(p)),
+        ("Прокси", (server.proxy or "caddy").capitalize() + " от бота" if p.managed_proxy and server else "не от бота"),
+        ("Секретный путь", "🔒 X-Api-Key" if p.protected else "выкл"),
+        ("Link Extractor", "✅" if p.link_extractor else "—"), ("Нод в боте", str(len(nodes))),
+    ])
+    text = card_html(card)
+    await show(c, text, card=card, markup=kb(
         [("🛰 Ноды", f"pn:nodes:{i}"), ("🌐 Хосты", f"hs:list:{i}:0")],
         [("🧬 Профили", f"pn:prof:{i}"), ("👥 Сквады", f"pn:sq:{i}")],
         [("🔗 Link Extractor", f"lx:v:{i}"), ("🧩 Модификации", f"mod:p:{i}")],
@@ -173,7 +175,6 @@ async def pn_fix(c: CallbackQuery):
                                                                         [("⬅️ К панели", f"pn:v:{p.id}")]))
     await c.answer("Чиню прокси…")
     await fix_proxy(c.bot, c.message.chat.id, server)
-    await say(c, "—", kb([("⬅️ К панели", f"pn:v:{p.id}")]))
 
 
 # ------------------------------------------------------------------ сервер панели
@@ -279,10 +280,10 @@ async def node_view(c: CallbackQuery):
         return await c.answer("Ноды нет", show_alert=True)
     s = await db.get(db.Server, n.server_id)
     i = n.id
-    await show(c, f"🛰 <b>{h(n.name)}</b>\nСервер: {h(s.name + ' · ' + s.host) if s else '— не привязан'}\n"
-                  f"Домены self-steal: {h(n.domain or '—')}\nUUID: <code>{h(n.rw_uuid or '—')}</code>\n"
-                  f"WARP: {'✅' if n.warp else '—'}",
-               kb([("🔄 Рестарт (API)", f"nd:rs:{i}"), ("🩺 Проверка", f"nd:chk:{i}")],
+    card = Card(f"🛰 {n.name}", [("Сервер", f"{s.name} · {s.host}" if s else "не привязан"),
+                                 ("Домены self-steal", n.domain or "—"), ("UUID", n.rw_uuid or "—", "code"),
+                                 ("WARP", "✅" if n.warp else "—")])
+    await show(c, card_html(card), card=card, markup=kb([("🔄 Рестарт (API)", f"nd:rs:{i}"), ("🩺 Проверка", f"nd:chk:{i}")],
                   [("🔐 Сертификат", f"crt:v:{i}"), ("🌐 WARP", f"mod:n:{i}")],
                   [("⬆️ Обновить ноду", f"upd:run:node:{i}"), ("🛡 Безопасность", f"sec:s:{n.server_id}")],
                   [("🖥 Привязать сервер", f"nd:srv:{i}"), ("🗑 Удалить", f"nd:del:{i}")],

@@ -13,7 +13,7 @@ from ..forms import Field, form, start_form
 from ..le_api import LeError
 from ..rw_api import RwError
 from ..runner import run_task
-from ..ui import chat_id, h, kb, say, show
+from ..ui import chat_id, h, kb, live, say, show
 from .panels import ensure_api_token
 
 router = Router(name="linkext")
@@ -535,12 +535,12 @@ async def _ua_field(values, ctx):
 ])
 async def lx_add_done(event, values, ctx):
     pid = ctx["panel"]
-    msg = await say(event, "⏳ Расшифровываю…")
+    await live(event, "⏳ Расшифровываю…")
     try:
         async with await le_api.for_panel(pid) as le:
             r = await le.call("POST", "/preview", {"text": values["text"], "userAgent": values["ua"]}, timeout=180)
     except LeError as e:
-        return await msg.edit_text(f"⚠️ {h(e)}")
+        return await live(event, f"⚠️ {h(e)}")
     lines, total = ["🔍 <b>Что нашёл</b>", ""], 0
     for s in r.get("sources", []):
         nodes = s.get("nodes", [])
@@ -552,9 +552,9 @@ async def lx_add_done(event, values, ctx):
             lines.append(f"   … ещё {len(nodes) - 12}")
         lines += [f"   ✖️ {h(e.get('error'))}" for e in (s.get("errors") or [])[:3]]
     if not total:
-        return await msg.edit_text("\n".join(lines) + "\nКлючей не найдено.", reply_markup=kb([("🔁 Ещё раз", f"lx:add:{pid}")]))
+        return await live(event, "\n".join(lines) + "\nКлючей не найдено.", kb([("🔁 Ещё раз", f"lx:add:{pid}")]))
     await db.set_setting(f"lx_add:{pid}", json.dumps({"text": values["text"], "ua": values["ua"]}))
-    await msg.edit_text("\n".join(lines)[:4000], reply_markup=kb([("➡️ Далее", f"lx:addok:{pid}")], [("✖️ Отмена", f"lx:v:{pid}")]))
+    await live(event, "\n".join(lines)[:4000], kb([("➡️ Далее", f"lx:addok:{pid}", "success")], [("✖️ Отмена", f"lx:v:{pid}")]))
 
 
 @router.callback_query(F.data.startswith("lx:add:"))
@@ -590,7 +590,7 @@ async def lx_add2_done(event, values, ctx):
         return await say(event, "Начни заново: 📥 Добавить ключи")
     flow = json.loads(raw)
     targets = await le_api.all_panels() if values["target"] == "all" else [await db.get(db.Panel, pid)]
-    msg = await say(event, f"⏳ Добавляю{f' в {len(targets)} панели' if len(targets) > 1 else ''}: создаю сквады и хосты…")
+    await live(event, f"⏳ Добавляю{f' в {len(targets)} панели' if len(targets) > 1 else ''}: создаю сквады и хосты…")
     lines, any_squad = ["✅ <b>Добавлено</b>", ""], False
     for t in targets:
         if len(targets) > 1:
@@ -612,7 +612,7 @@ async def lx_add2_done(event, values, ctx):
     if any_squad:
         lines += ["", "👉 Добавь юзеров в новые сквады: панель → Внутренние сквады."]
     await db.set_setting(f"lx_add:{pid}", None)
-    await msg.edit_text("\n".join(lines)[:4000], reply_markup=kb([("📚 Источники", f"lx:src:{pid}"), ("⬅️ Экстрактор", f"lx:v:{pid}")]))
+    await live(event, "\n".join(lines)[:4000], kb([("📚 Источники", f"lx:src:{pid}"), ("⬅️ Экстрактор", f"lx:v:{pid}")]))
 
 
 @router.callback_query(F.data.startswith("lx:addok:"))

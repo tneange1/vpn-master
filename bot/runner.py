@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
 
 from . import db, ssh
-from .ui import h
+from .ui import CTX, back_kb, h, render
 
 MARK_RE = re.compile(r"^##VM (\w+)=(.*)$", re.M)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[()][A-Z0-9]|\x1b[=>]")
@@ -37,16 +37,26 @@ def clean(text: str) -> str:
     return "\n".join(lines)
 
 
-def _render(title: str, server: str, body: str, status: str) -> str:
-    tail = body[-3200:]
-    if len(body) > 3200:
+def _render(title: str, server: str, body: str, status: str, steps: list | None = None) -> str:
+    tail = body[-3000:]
+    if len(body) > 3000:
         tail = "…" + tail[tail.find("\n") + 1:]
-    return f"{status} <b>{h(title)}</b> · <code>{h(server)}</code>\n<pre>{h(tail) or '…'}</pre>"
+    done = "".join(f"{'✅' if ok else '❌'} {h(t)}\n" for ok, t in (steps or []))
+    return f"{done}{status} <b>{h(title)}</b> · <code>{h(server)}</code>\n<pre>{h(tail) or '…'}</pre>"
 
 
 async def run_task(bot: Bot, chat_id: int, server: db.Server, title: str, script: str,
                    timeout: int = 2400) -> Result:
-    msg = await bot.send_message(chat_id, _render(title, server.name, "подключаюсь…", "⏳"))
+    """Выполнить скрипт с живым логом. Если действие запущено кнопкой/формой — лог идёт в то же
+    сообщение (а не новое), в конце — «⬅️ Назад» на прежний экран и «🏠 Меню»."""
+    ctx = CTX.get()
+    steps = ctx["steps"] if ctx is not None else None
+    if ctx is not None and ctx.get("chat") == chat_id:
+        mid = await render(bot, chat_id, ctx.get("mid"), _render(title, server.name, "подключаюсь…", "⏳", steps))
+        ctx["mid"] = mid
+    else:
+        ctx = None
+        mid = (await bot.send_message(chat_id, _render(title, server.name, "подключаюсь…", "⏳"))).message_id
     buf: list[str] = []
     done = asyncio.Event()
 
@@ -59,10 +69,10 @@ async def run_task(bot: Bot, chat_id: int, server: db.Server, title: str, script
                 pass
             if done.is_set():
                 return
-            text = _render(title, server.name, clean("".join(buf)), "⏳")
+            text = _render(title, server.name, clean("".join(buf)), "⏳", steps)
             if text != last:
                 try:
-                    await msg.edit_text(text)
+                    await bot.edit_message_text(text, chat_id=chat_id, message_id=mid)
                     last = text
                 except TelegramBadRequest:
                     pass
@@ -79,11 +89,15 @@ async def run_task(bot: Bot, chat_id: int, server: db.Server, title: str, script
     marks = {m.group(1): m.group(2).strip() for m in MARK_RE.finditer(out)}
     body = clean(out)
     ok = code == 0
+    markup = back_kb(ctx.get("back")) if ctx is not None else None
     try:
-        await msg.edit_text(_render(title, server.name, body + f"\n\n[exit {code}]", "✅" if ok else "❌"))
+        await bot.edit_message_text(_render(title, server.name, body + f"\n\n[exit {code}]", "✅" if ok else "❌", steps),
+                                    chat_id=chat_id, message_id=mid, reply_markup=markup)
     except TelegramBadRequest:
         pass
-    if len(body) > 3200:
+    if steps is not None:
+        steps.append((ok, title))
+    if len(body) > 3000:
         await bot.send_document(chat_id, BufferedInputFile(body.encode(), filename="log.txt"),
                                 caption=f"Полный лог: {h(title)}")
     await db.save(db.Log(server_id=server.id, title=title, ok=ok, tail=body[-4000:]))

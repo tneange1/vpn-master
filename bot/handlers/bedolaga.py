@@ -7,7 +7,7 @@ from aiogram.types import CallbackQuery
 from .. import crypto, db, discover, proxy, scripts
 from ..forms import Field, form, start_form
 from ..runner import run_task
-from ..ui import chat_id, h, kb, say, show
+from ..ui import Card, card_html, chat_id, h, kb, say, show
 from .servers import server_label
 
 router = Router(name="bedolaga")
@@ -81,7 +81,6 @@ async def srv_fix(c: CallbackQuery, bot: Bot):
     s = await db.get(db.Server, _id(c.data))
     await c.answer("Чиню прокси…")
     await discover.fix_proxy(bot, c.message.chat.id, s)
-    await say(c, "—", kb([("🖥 К серверу", f"srv:v:{s.id}")]))
 
 
 # ------------------------------------------------------------------ карточка бота
@@ -93,21 +92,22 @@ async def bd_view(c: CallbackQuery):
     s = await db.get(db.Server, b.server_id)
     p = await db.get(db.Panel, b.panel_id) if b.panel_id else None
     i = b.id
-    text = (f"🤖 <b>{h(b.name)}</b>\n"
-            f"Сервер: {h(s.name + ' · ' + s.host) if s else '—'}\n"
-            f"Папка: <code>{h(b.install_dir)}</code> · <code>{h(b.compose_file)}</code>\n"
-            f"Вебхуки/API: {('https://' + h(b.hooks_domain)) if b.hooks_domain else '—'}\n"
-            f"Панель: {h(p.domain) if p else '—'}"
-            + (" · 🔒 через X-Api-Key" if p and p.protected else "") + "\n"
-            f"Кабинет: {('https://' + h(b.cabinet_domain)) if b.cabinet else '—'}\n"
-            f"Админы: <code>{h(b.admin_ids or '—')}</code>")
+    card = Card(f"🤖 {b.name}", [
+        ("Сервер", f"{s.name} · {s.host}" if s else "—"),
+        ("Папка", f"{b.install_dir} · {b.compose_file}", "code"),
+        ("Вебхуки / API", f"https://{b.hooks_domain}" if b.hooks_domain else "—"),
+        ("Панель", (p.domain + (" · 🔒 X-Api-Key" if p.protected else "")) if p else "—"),
+        ("Кабинет", f"https://{b.cabinet_domain}" if b.cabinet else "—"),
+        ("Админы", b.admin_ids or "—", "code"),
+    ])
+    text = card_html(card)
     rows = [[("📊 Статус", f"bd:st:{i}"), ("📜 Логи", f"bd:lg:{i}")],
             [("🔄 Перезапуск", f"bd:rs:{i}"), ("⬆️ Обновить", f"upd:run:bedolaga:{i}")],
             [("⚙️ Настройки (.env)", f"bd:env:{i}"), ("🔑 Доступ к панели", f"bd:acc:{i}")],
             [("🗂 Кабинет", f"bd:cab:{i}")] if b.cabinet else [("➕ Поставить кабинет", "inst:cab")],
             [("🩹 Фикс reverse proxy", f"srv:fix:{b.server_id}"), ("🔗 Панель", f"bd:pn:{i}")],
             [("🗑 Убрать из бота", f"bd:del:{i}"), ("⬅️ Боты", "bd:list")]]
-    await show(c, text, kb(*rows))
+    await show(c, text, kb(*rows), card=card)
 
 
 @router.callback_query(F.data.startswith(("bd:st:", "bd:lg:", "bd:rs:")))

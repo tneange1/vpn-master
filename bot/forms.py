@@ -10,7 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from .ui import h, kb, show
+from .ui import CTX, SCREENS, back_kb, chat_id, h, kb, render, show
 
 router = Router(name="forms")
 
@@ -49,9 +49,26 @@ def form(name: str, title: str, fields: list):
 
 
 async def start_form(event, state: FSMContext, name: str, ctx: dict | None = None, preset: dict | None = None):
+    """Форма живёт в одном сообщении: вопросы правят его, ответы пользователя удаляются."""
+    pmid, back = None, None
+    if isinstance(event, CallbackQuery):
+        pmid = event.message.message_id
+        back = SCREENS.get((event.message.chat.id, pmid))
     await state.set_state(FormSt.filling)
-    await state.update_data(form=name, idx=-1, values=dict(preset or {}), ctx=ctx or {}, opts=[])
+    await state.update_data(form=name, idx=-1, values=dict(preset or {}), ctx=ctx or {}, opts=[], pmid=pmid, back=back)
     await _next(event, state)
+
+
+async def _screen(event, state: FSMContext, text: str, markup) -> None:
+    data = await state.get_data()
+    chat = chat_id(event)
+    if isinstance(event, CallbackQuery):
+        try:
+            await event.answer()
+        except TelegramBadRequest:
+            pass
+    mid = await render(event.bot, chat, data.get("pmid"), text, markup)
+    await state.update_data(pmid=mid)
 
 
 async def _choices(f: Field, values, ctx):
@@ -63,7 +80,14 @@ async def _choices(f: Field, values, ctx):
     return list(ch or [])
 
 
-async def _next(event, state: FSMContext):
+async def _reprompt(event, state: FSMContext, warn: str) -> None:
+    """Повторить текущий вопрос с предупреждением (в том же сообщении)."""
+    data = await state.get_data()
+    await state.update_data(idx=data["idx"] - 1)
+    await _next(event, state, warn)
+
+
+async def _next(event, state: FSMContext, warn: str = ""):
     data = await state.get_data()
     form_ = FORMS[data["form"]]
     values, ctx = data["values"], data["ctx"]
@@ -74,8 +98,14 @@ async def _next(event, state: FSMContext):
             break
         idx += 1
     if idx >= len(form_.fields):
+        pmid, back = data.get("pmid"), data.get("back")
         await state.clear()
-        await form_.done(event, values, ctx)
+        # результат формы (логи задач) — в то же сообщение, с кнопкой «Назад» на исходный экран
+        token = CTX.set({"chat": chat_id(event), "mid": pmid, "back": back, "steps": []})
+        try:
+            await form_.done(event, values, ctx)
+        finally:
+            CTX.reset(token)
         return
     f = form_.fields[idx]
     rows, opts = [], []
@@ -83,8 +113,9 @@ async def _next(event, state: FSMContext):
         try:
             choices = await _choices(f, values, ctx)
         except Exception as e:  # noqa: BLE001
+            back = data.get("back")
+            await _screen(event, state, f"❌ Не удалось получить варианты: <code>{h(e)}</code>", back_kb(back))
             await state.clear()
-            await show(event, f"❌ Не удалось получить варианты: <code>{h(e)}</code>", kb([("🏠 Меню", "menu")]))
             return
         for i, (label, val) in enumerate(choices):
             rows.append([(label, f"f:c:{i}")])
@@ -97,7 +128,7 @@ async def _next(event, state: FSMContext):
     nav.append(("✖️ Отмена", "f:x"))
     rows.append(nav)
     await state.update_data(idx=idx, opts=opts)
-    await show(event, f"<b>{h(form_.title)}</b>\n\n{f.prompt}", kb(*rows))
+    await _screen(event, state, f"<b>{h(form_.title)}</b>\n\n{f.prompt}" + (f"\n\n⚠️ {warn}" if warn else ""), kb(*rows))
 
 
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z0-9-]{2,63}$")
@@ -139,20 +170,17 @@ def _convert(f: Field, v: str):
 async def on_text(m: Message, state: FSMContext):
     data = await state.get_data()
     f: Field = FORMS[data["form"]].fields[data["idx"]]
-    if f.kind == "choice":
-        await m.answer("Выбери вариант кнопкой выше 👆")
-        return
     raw = m.text if f.kind == "raw" else m.text.strip()
-    if f.secret:
-        try:
-            await m.delete()
-        except TelegramBadRequest:
-            pass
+    try:  # ответы не копятся в чате — всё в одном сообщении формы
+        await m.delete()
+    except TelegramBadRequest:
+        pass
+    if f.kind == "choice":
+        return await _reprompt(m, state, "выбери вариант кнопкой")
     try:
         value = _convert(f, raw)
     except ValueError as e:
-        await m.answer(f"⚠️ {e}. Попробуй ещё раз.")
-        return
+        return await _reprompt(m, state, f"{e}. Попробуй ещё раз.")
     values = data["values"]
     values[f.key] = value
     await state.update_data(values=values)
@@ -165,22 +193,21 @@ async def on_document(m: Message, state: FSMContext):
     data = await state.get_data()
     f: Field = FORMS[data["form"]].fields[data["idx"]]
     if f.kind != "raw":
-        await m.answer("Тут нужен текст, а не файл.")
-        return
+        await m.delete()
+        return await _reprompt(m, state, "тут нужен текст, а не файл")
     if m.document.file_size and m.document.file_size > 64 * 1024:
-        await m.answer("⚠️ Файл больше 64 КБ — это точно ключ?")
-        return
+        await m.delete()
+        return await _reprompt(m, state, "файл больше 64 КБ — это точно ключ?")
     buf = await m.bot.download(m.document)
     try:
         text = buf.read().decode("utf-8")
     except UnicodeDecodeError:
-        await m.answer("⚠️ Файл не текстовый. Нужен ключ в формате OpenSSH/PEM.")
-        return
-    if f.secret:
-        try:
-            await m.delete()
-        except TelegramBadRequest:
-            pass
+        await m.delete()
+        return await _reprompt(m, state, "файл не текстовый, нужен ключ OpenSSH/PEM")
+    try:
+        await m.delete()
+    except TelegramBadRequest:
+        pass
     values = data["values"]
     values[f.key] = text
     values.setdefault("_filename", m.document.file_name)
@@ -189,8 +216,12 @@ async def on_document(m: Message, state: FSMContext):
 
 
 @router.message(FormSt.filling)
-async def on_other(m: Message):
-    await m.answer("Жду текст (или файл, если просят ключ).")
+async def on_other(m: Message, state: FSMContext):
+    try:
+        await m.delete()
+    except TelegramBadRequest:
+        pass
+    await _reprompt(m, state, "жду текст (или файл, если просят ключ)")
 
 
 @router.callback_query(FormSt.filling, F.data.startswith("f:c:"))
@@ -220,8 +251,9 @@ async def on_skip(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "f:x")
 async def on_cancel(c: CallbackQuery, state: FSMContext):
+    back = (await state.get_data()).get("back")
     await state.clear()
-    await show(c, "Отменено.", kb([("🏠 Меню", "menu")]))
+    await show(c, "✖️ Отменено.", back_kb(back))
 
 
 @router.callback_query(F.data == "noop")

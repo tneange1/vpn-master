@@ -154,7 +154,6 @@ async def ufw_allow_done(event, values, ctx):
     if not UFW_RULE_RE.match(rule):
         return await say(event, "❌ Не понял правило.", kb([("🔁 Ещё раз", f"ufw:allow:{s.id}")]))
     await run_task(event.bot, chat_id(event), s, f"UFW allow {rule}", scripts.ufw_allow(rule))
-    await say(event, "—", kb([("⬅️ UFW", f"ufw:m:{s.id}")]))
 
 
 @router.callback_query(F.data.startswith("ufw:allow:"))

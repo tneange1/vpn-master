@@ -9,15 +9,22 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from .. import backup, config, db, selfupdate, terminal
-from ..ui import h, kb, say, show
+from ..ui import Card, card_html, h, kb, say, show
 
 router = Router(name="common")
 
 
+async def main_card() -> Card:
+    st = selfupdate.status()
+    return Card("🛰 VPN Master", [
+        ("🖥 Серверов", str(await db.count(db.Server))), ("🌊 Панелей", str(await db.count(db.Panel))),
+        ("🛰 Нод", str(await db.count(db.Node))), ("🤖 Ботов Bedolaga", str(await db.count(db.Bedolaga))),
+        ("🔑 SSH-ключей", str(await db.count(db.SshKey))),
+    ], footer=f"версия {st.get('commit', '?')}" if st else None)
+
+
 async def main_text() -> str:
-    return ("🛰 <b>VPN Master</b>\n\n"
-            f"Серверов: {await db.count(db.Server)} · Панелей: {await db.count(db.Panel)} · "
-            f"Нод: {await db.count(db.Node)} · Ботов: {await db.count(db.Bedolaga)}")
+    return card_html(await main_card())
 
 
 MAIN_KB = kb([("📦 Установка", "inst"), ("🛠 Управление", "mng")],
@@ -30,13 +37,13 @@ MAIN_KB = kb([("📦 Установка", "inst"), ("🛠 Управление",
 @router.message(Command("menu"))
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(await main_text(), reply_markup=MAIN_KB)
+    await show(m, await main_text(), MAIN_KB, card=await main_card())
 
 
 @router.callback_query(F.data == "menu")
 async def menu(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await show(c, await main_text(), MAIN_KB)
+    await show(c, await main_text(), MAIN_KB, card=await main_card())
 
 
 @router.callback_query(F.data == "help")

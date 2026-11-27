@@ -40,7 +40,12 @@ def x25519() -> tuple[str, str]:
     return b64(priv), b64(pub)
 
 
-def reality_inbound(domains: list[str], tag: str = "VLESS-SELFSTEAL", port: int = 443) -> dict:
+def cert_paths(cert: str = "key") -> tuple[str, str]:
+    return f"/etc/letsencrypt/live/{cert}/fullchain.pem", f"/etc/letsencrypt/live/{cert}/privkey.pem"
+
+
+def reality_inbound(domains: list[str], tag: str = "VLESS-SELFSTEAL", port: int = 443,
+                    target: str = SELFSTEAL_TARGET) -> dict:
     priv, _pub = x25519()
     return {
         "tag": tag,
@@ -53,7 +58,7 @@ def reality_inbound(domains: list[str], tag: str = "VLESS-SELFSTEAL", port: int 
             "network": "raw",
             "security": "reality",
             "realitySettings": {
-                "target": SELFSTEAL_TARGET,
+                "target": target,
                 "privateKey": priv,
                 "shortIds": [secrets.token_hex(8)],
                 "serverNames": list(domains),
@@ -62,13 +67,14 @@ def reality_inbound(domains: list[str], tag: str = "VLESS-SELFSTEAL", port: int 
     }
 
 
-def hysteria_inbound(tag: str = "HYSTERIA-BBR", port: int = 443, bbr: bool = True) -> dict:
+def hysteria_inbound(tag: str = "HYSTERIA-BBR", port: int = 443, bbr: bool = True, cert: str = "key") -> dict:
+    cert_file, key_file = cert_paths(cert)
     stream = {
         "network": "hysteria",
         "security": "tls",
         "tlsSettings": {
             "alpn": ["h3"],
-            "certificates": [{"keyFile": KEY_FILE, "certificateFile": CERT_FILE}],
+            "certificates": [{"keyFile": key_file, "certificateFile": cert_file}],
         },
         "hysteriaSettings": {"version": 2},
     }
@@ -84,15 +90,18 @@ def hysteria_inbound(tag: str = "HYSTERIA-BBR", port: int = 443, bbr: bool = Tru
     }
 
 
-def build_profile(kind: str, domains: list[str] | str, prefix: str = "", bbr: bool = True) -> dict:
+def build_profile(kind: str, domains: list[str] | str, prefix: str = "", bbr: bool = True, *,
+                  reality_port: int = 443, hy2_port: int = 443, ss_port: int = 8443, cert: str = "key") -> dict:
+    """Профиль по мануалу. Порты/сертификат настраиваются — чтобы на одном сервере жили несколько нод."""
     if isinstance(domains, str):
         domains = [d for d in domains.split(",") if d]
     p = (prefix.upper().replace(" ", "-") + "-") if prefix else ""
     inbounds = []
     if kind in ("hy2", "both"):
-        inbounds.append(hysteria_inbound(tag=f"{p}HYSTERIA-BBR", bbr=bbr))
+        inbounds.append(hysteria_inbound(tag=f"{p}HYSTERIA-BBR", port=hy2_port, bbr=bbr, cert=cert))
     if kind in ("reality", "both"):
-        inbounds.append(reality_inbound(domains, tag=f"{p}VLESS-SELFSTEAL"))
+        inbounds.append(reality_inbound(domains, tag=f"{p}VLESS-SELFSTEAL", port=reality_port,
+                                        target=f"127.0.0.1:{ss_port}"))
     return {
         "log": {"loglevel": "none"},
         "inbounds": inbounds,

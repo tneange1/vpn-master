@@ -59,8 +59,11 @@ async def upd_bot(c: CallbackQuery):
 async def _target(kind: str, obj_id: str):
     """Возвращает (server, script, title)."""
     if kind in ("node", "selfsteal"):
+        from .panels import spec_of
         n = await db.get(db.Node, obj_id)
-        return await db.get(db.Server, n.server_id), scripts.UPDATES[kind], f"{LABEL[kind]} {n.name}"
+        spec = await spec_of(n)
+        script = scripts.node_update(spec) if kind == "node" else scripts.selfsteal_update(spec)
+        return await db.get(db.Server, n.server_id), script, f"{LABEL[kind]} {n.name}"
     if kind in ("bedolaga", "cabinet"):
         b = await db.get(db.Bedolaga, obj_id)
         srv_id = b.server_id
@@ -85,6 +88,7 @@ async def upd_run(c: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data.startswith("upd:allnodes:"))
 async def upd_all_nodes(c: CallbackQuery, bot: Bot):
+    from .panels import spec_of
     p = await db.get(db.Panel, c.data.split(":")[2])
     await c.answer()
     results = []
@@ -93,6 +97,7 @@ async def upd_all_nodes(c: CallbackQuery, bot: Bot):
         if not server:
             results.append(f"⚪️ {h(n.name)}: нет сервера")
             continue
-        r = await run_task(bot, c.message.chat.id, server, f"Обновление ноды {n.name}", scripts.UPDATES["node"])
+        r = await run_task(bot, c.message.chat.id, server, f"Обновление ноды {n.name}",
+                           scripts.node_update(await spec_of(n)))
         results.append(f"{'✅' if r.ok else '❌'} {h(n.name)}")
     await say(c, "Итог:\n" + "\n".join(results), kb([("⬅️ Назад", f"upd:p:{p.id}")]))

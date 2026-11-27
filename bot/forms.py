@@ -156,6 +156,15 @@ def _convert(f: Field, v: str):
         if not out:
             raise ValueError("нужен хотя бы один домен")
         return ",".join(dict.fromkeys(out))
+    if f.kind == "slug":
+        v = v.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{1,39}", v):
+            raise ValueError("только латиница, цифры, <code>- _ .</code>, 2–40 символов")
+        return v
+    if f.kind == "port":
+        if not v.isdigit() or not 1 <= int(v) <= 65535:
+            raise ValueError("порт — число 1–65535")
+        return int(v)
     if f.kind == "ids":
         ids = [x for x in re.split(r"[,\s]+", v) if x]
         if not ids or not all(x.lstrip("-").isdigit() for x in ids):

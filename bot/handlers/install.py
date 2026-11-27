@@ -64,6 +64,7 @@ async def install_menu(c: CallbackQuery):
                   "Перед установкой направь A-записи доменов на нужный сервер.\n"
                   "Сервер выбираешь в первом шаге (или добавляешь новый: IP, пользователь, пароль или SSH-ключ).",
                kb([("🌊 Remnawave (панель + подписка)", "inst:rw")],
+                  [("🛰 Нода в панель (self-steal + Nginx)", "inst:node")],
                   [("🤖 Bedolaga Bot", "inst:bb")],
                   [("🗂 Bedolaga Cabinet", "inst:cab")],
                   [("🔗 Подключить существующую панель", "inst:rwx")],
@@ -115,6 +116,15 @@ async def inst_rw_done(event, values, ctx):
             f"Прокси: {kind.capitalize()} · секретный путь: {'🔒 вкл' if panel.protected else 'выкл'}\n\n"
             "Всё сохранено в БД (📇 Доступы → Панели).")
     await say(event, text, kb([("🖥 К панели", f"pn:v:{panel.id}")], [("🏠 Меню", "menu")]))
+
+
+@router.callback_query(F.data == "inst:node")
+async def inst_node(c: CallbackQuery, state: FSMContext):
+    from ..rw_api import has_api
+    if not [p for p in await db.all_(db.Panel) if has_api(p)]:
+        return await show(c, "Сначала установи или подключи панель Remnawave (с доступом к API).",
+                          kb([("⬅️ Назад", "inst")]))
+    await start_form(c, state, "node_add")
 
 
 @router.callback_query(F.data == "inst:rw")

@@ -280,14 +280,48 @@ async def node_view(c: CallbackQuery):
         return await c.answer("Ноды нет", show_alert=True)
     s = await db.get(db.Server, n.server_id)
     i = n.id
+    sp = await spec_of(n)
     card = Card(f"🛰 {n.name}", [("Сервер", f"{s.name} · {s.host}" if s else "не привязан"),
-                                 ("Домены self-steal", n.domain or "—"), ("UUID", n.rw_uuid or "—", "code"),
-                                 ("WARP", "✅" if n.warp else "—")])
+                                 ("Контейнер", f"{sp.ct} · {sp.dir}", "code"),
+                                 ("NODE_PORT", str(sp.node_port)),
+                                 ("Порты", " · ".join(x for x in (f"Reality {sp.reality_port}/tcp" if sp.reality_port else "",
+                                                                  f"Hy2 {sp.hy2_port}/udp" if sp.hy2_port else "",
+                                                                  f"self-steal 127.0.0.1:{sp.ss_port}" if sp.selfsteal else "") if x)),
+                                 ("Домены self-steal", n.domain or "—"), ("Сертификат", sp.cert, "code"),
+                                 ("UUID", n.rw_uuid or "—", "code"), ("WARP", "✅" if n.warp else "—")])
     await show(c, card_html(card), card=card, markup=kb([("🔄 Рестарт (API)", f"nd:rs:{i}"), ("🩺 Проверка", f"nd:chk:{i}")],
                   [("🔐 Сертификат", f"crt:v:{i}"), ("🌐 WARP", f"mod:n:{i}")],
                   [("⬆️ Обновить ноду", f"upd:run:node:{i}"), ("🛡 Безопасность", f"sec:s:{n.server_id}")],
-                  [("🖥 Привязать сервер", f"nd:srv:{i}"), ("🗑 Удалить", f"nd:del:{i}")],
+                  [("🖥 Привязать сервер", f"nd:srv:{i}"), ("🔁 Переустановить на сервере", f"nd:re:{i}")],
+                  [("🗑 Удалить", f"nd:del:{i}")],
                   [("⬅️ Ноды", f"pn:nodes:{n.panel_id}")]))
+
+
+@router.callback_query(F.data.startswith("nd:re:"))
+async def node_reinstall(c: CallbackQuery):
+    i = c.data.split(":")[2]
+    await show(c, "🔁 Переустановить ноду на сервере (сертификат, Nginx self-steal, контейнер) с теми же параметрами? "
+                  "Профиль, хосты и сквад в панели не трогаю.",
+               kb([("✅ Да, переустановить", f"nd:reok:{i}")], [("✖️ Нет", f"nd:v:{i}")]))
+
+
+@router.callback_query(F.data.startswith("nd:reok:"))
+async def node_reinstall_ok(c: CallbackQuery):
+    n = await db.get(db.Node, c.data.split(":")[2])
+    p = await db.get(db.Panel, n.panel_id)
+    s = await _node_server(c, n)
+    if not s:
+        return
+    await c.answer()
+    try:
+        async with for_panel(p) as rw:
+            secret = await rw.keygen()
+    except RwError as e:
+        return await say(c, f"❌ API панели: <code>{h(e)}</code>")
+    panel_srv = await db.get(db.Server, p.server_id)
+    panel_ip = await _resolve(panel_srv.host if panel_srv else p.domain)
+    await run_task(c.bot, c.message.chat.id, s, f"Переустановка ноды {n.name}",
+                   scripts.node_install(secret, await spec_of(n), panel_ip, await db.setting("acme_email") or None))
 
 
 @form("nd_srv", "🖥 Сервер ноды", SERVER_FIELDS)
@@ -319,7 +353,7 @@ async def node_check(c: CallbackQuery):
     n = await db.get(db.Node, c.data.split(":")[2])
     if s := await _node_server(c, n):
         await c.answer()
-        await run_task(c.bot, c.message.chat.id, s, f"Проверка ноды {n.name}", scripts.NODE_CHECK)
+        await run_task(c.bot, c.message.chat.id, s, f"Проверка ноды {n.name}", scripts.node_check(await spec_of(n)))
 
 
 @router.callback_query(F.data.startswith("nd:rs:"))
@@ -359,8 +393,12 @@ async def node_del_ok(c: CallbackQuery):
 
 
 # ------------------------------------------------------------------ добавление ноды
+def _pid(values, ctx) -> int:
+    return int(ctx.get("panel") or values.get("panel"))
+
+
 async def profile_choices(values, ctx):
-    p = await db.get(db.Panel, ctx["panel"])
+    p = await db.get(db.Panel, _pid(values, ctx))
     rows = [(f"✨ Новый: {label}", f"new:{k}") for k, label in xray.KINDS.items()]
     async with for_panel(p) as rw:
         for pr in await rw.profiles():
@@ -369,10 +407,15 @@ async def profile_choices(values, ctx):
 
 
 async def squad_choices(values, ctx):
-    p = await db.get(db.Panel, ctx["panel"])
+    p = await db.get(db.Panel, _pid(values, ctx))
     async with for_panel(p) as rw:
         rows = [(f"👥 {s['name']}", s["uuid"]) for s in await rw.squads()]
-    return rows + [("➕ Новый сквад", "new"), ("⏭ Не добавлять в сквад", "skip")]
+    return [(f"➕ Новый сквад «{values.get('name', '')}»", "new")] + rows + [("⏭ Не добавлять в сквад", "skip")]
+
+
+async def panel_pick(values, ctx):
+    from ..rw_api import has_api as _has
+    return [(f"🖥 {p.name} · {p.domain}", p.id) for p in await db.all_(db.Panel) if _has(p)]
 
 
 def _is_new(v):
@@ -383,49 +426,99 @@ def _needs_domains(v):
     return _is_new(v) or v.get("selfsteal")
 
 
-async def _email_default(values, ctx):
-    return await db.setting("acme_email", "")
+def _has_reality(v):
+    return v.get("profile") in ("new:reality", "new:both")
 
 
-@form("node_add", "➕ Новая нода", SERVER_FIELDS + [
-    Field("name", "Имя ноды, например <code>DE-1</code>:"),
+def _has_hy2(v):
+    return v.get("profile") in ("new:hy2", "new:both")
+
+
+async def spec_of(n: db.Node) -> scripts.NodeSpec:
+    """Параметры ноды на сервере (контейнер, порты, сертификат). Старые ноды — значения по умолчанию."""
+    raw = await db.setting(f"nodespec:{n.id}")
+    spec = scripts.NodeSpec.from_json(json.loads(raw) if raw else None)
+    if not spec.domains and n.domain:
+        spec.domains = [d for d in n.domain.split(",") if d]
+    return spec
+
+
+async def _specs_on(server_id: int) -> list[tuple[db.Node, scripts.NodeSpec]]:
+    return [(n, await spec_of(n)) for n in await db.all_(db.Node, db.Node.server_id == server_id)]
+
+
+@form("node_add", "🛰 Установка ноды", [
+    Field("panel", "🖥 В какую панель добавить ноду?", "choice", choices=panel_pick),
+] + SERVER_FIELDS + [
+    Field("name", "Имя ноды в панели, например <code>DE-1</code>:"),
+    Field("ct", "Имя контейнера ноды на сервере. Первая нода — <code>remnanode</code> (по мануалу, /opt/remnanode). "
+                "Вторая и следующие на <b>том же</b> сервере — своё имя, например <code>remnanode2</code>:",
+          "slug", optional=True, default="remnanode"),
+    Field("node_port", "Порт remnanode (<code>NODE_PORT</code>, связь панели с нодой). "
+                       "Для второй ноды на сервере — другой, например <code>2223</code>:", "port",
+          optional=True, default=2222),
     Field("profile", "Профиль конфигурации:", "choice", choices=profile_choices),
-    Field("selfsteal", "Поставить self-steal (certbot + Nginx на 127.0.0.1:8443)?", "choice",
+    Field("selfsteal", "Поставить self-steal (certbot + Nginx)?", "choice",
           choices=[("✅ Да", True), ("Нет", False)], when=lambda v: str(v.get("profile", "")).startswith("p:")),
-    Field("domains", "Домены ноды через запятую — все в один сертификат (<code>--cert-name key</code>) и в "
-                     "serverNames Reality.\nНапример: <code>de.example.com, cdn.example.space</code>\n"
-                     "A-записи → IP ноды, порт 80 должен быть свободен.", "domains", when=_needs_domains),
-    Field("email", "E-mail для Let's Encrypt (уведомления о сертификате):", optional=True, default="",
-          when=_needs_domains),
-    Field("bbr", "Hysteria2: включить BBR (<code>finalmask</code>)? Нужна свежая версия ноды.", "choice",
-          choices=[("✅ Да, BBR", True), ("Нет", False)],
-          when=lambda v: v.get("profile") in ("new:hy2", "new:both")),
-    Field("squad", "В какой внутренний сквад добавить инбаунды?", "choice", choices=squad_choices),
-    Field("squad_name", "Название нового сквада:", when=lambda v: v.get("squad") == "new"),
+    Field("domains", "Домен(ы) для self-steal через запятую — в сертификат и в serverNames Reality.\n"
+                     "Например: <code>de.example.com</code>\nA-запись → IP ноды, порт 80 должен быть свободен.",
+          "domains", when=_needs_domains),
+    Field("ss_port", "Локальный порт Nginx self-steal (127.0.0.1). Для второй ноды — другой, например <code>8444</code>:",
+          "port", optional=True, default=8443, when=_needs_domains),
+    Field("reality_port", "TCP-порт VLESS Reality. Две ноды на одном IP не могут оба занять 443 — "
+                          "для второй укажи другой, например <code>2443</code> (не равный порту self-steal):",
+          "port", optional=True, default=443, when=_has_reality),
+    Field("hy2_port", "UDP-порт Hysteria2 (для второй ноды на этом IP — другой):", "port",
+          optional=True, default=443, when=_has_hy2),
+    Field("email", "E-mail для Let's Encrypt:", optional=True, default="", when=_needs_domains),
+    Field("bbr", "Hysteria2: BBR (<code>finalmask</code>)? Нужна свежая версия ноды.", "choice",
+          choices=[("✅ Да, BBR", True), ("Нет", False)], when=_has_hy2),
+    Field("squad", "Внутренний сквад для инбаундов ноды:", "choice", choices=squad_choices),
     Field("country", "Код страны (2 буквы, напр. DE):", optional=True, default="XX"),
 ])
 async def node_add_done(event, values, ctx):
-    p = await db.get(db.Panel, ctx["panel"])
+    p = await db.get(db.Panel, _pid(values, ctx))
     try:
         server = await ensure_server(event, values)
     except RuntimeError as e:
-        return await say(event, f"❌ {h(e)}", kb([("🏠 Меню", "menu")]))
+        return await say(event, f"❌ {h(e)}")
     if not server:
         return await say(event, "❌ Для ноды нужен SSH-доступ к серверу.")
     name = values["name"]
     domains = [d for d in (values.get("domains") or "").split(",") if d]
+    prof_val = values["profile"]
+    spec = scripts.NodeSpec(
+        ct=values.get("ct") or "remnanode", node_port=int(values.get("node_port") or 2222),
+        ss_port=int(values.get("ss_port") or 8443), domains=domains,
+        selfsteal=_is_new(values) or bool(values.get("selfsteal")),
+        reality_port=int(values.get("reality_port") or 443) if _has_reality(values) or not _is_new(values) else None,
+        hy2_port=int(values.get("hy2_port") or 443) if _has_hy2(values) else None)
+    # конфликты с другими нодами этого сервера (по данным бота)
+    clash = []
+    for n2, s2 in await _specs_on(server.id):
+        if s2.ct == spec.ct:
+            clash.append(f"контейнер {s2.ct} уже занят нодой {n2.name}")
+        for label, a, b in (("NODE_PORT", spec.node_port, s2.node_port), ("self-steal", spec.ss_port, s2.ss_port),
+                            ("Reality", spec.reality_port, s2.reality_port), ("Hysteria2", spec.hy2_port, s2.hy2_port)):
+            if a and a == b:
+                clash.append(f"{label} {a} уже у ноды {n2.name}")
+    if spec.reality_port and spec.selfsteal and spec.reality_port == spec.ss_port:
+        clash.append("порт Reality совпадает с портом self-steal")
+    if clash:
+        return await say(event, "❌ На этом сервере уже есть нода с такими параметрами:\n• " + "\n• ".join(map(h, clash))
+                         + "\n\nУкажи другое имя контейнера и порты.", kb([("🔁 Заново", f"pn:addnode:{p.id}")]))
     if values.get("email"):
         await db.set_setting("acme_email", values["email"])
     email = values.get("email") or await db.setting("acme_email") or None
-    prof_val = values["profile"]
-    selfsteal = _is_new(values) or bool(values.get("selfsteal"))
     report = []
     try:
         async with for_panel(p) as rw:
             secret = await rw.keygen()
             if prof_val.startswith("new:"):
                 kind = prof_val[4:]
-                cfg = xray.build_profile(kind, domains, prefix=name, bbr=values.get("bbr", True))
+                cfg = xray.build_profile(kind, domains, prefix=name, bbr=values.get("bbr", True),
+                                         reality_port=spec.reality_port or 443, hy2_port=spec.hy2_port or 443,
+                                         ss_port=spec.ss_port, cert=spec.cert)
                 prof = await rw.create_profile(name, cfg)
                 report.append(f"🧬 Профиль <b>{h(name)}</b> создан ({h(xray.KINDS[kind])})")
             else:
@@ -433,21 +526,21 @@ async def node_add_done(event, values, ctx):
                 report.append(f"🧬 Профиль: {h(prof.get('name'))}")
             inbounds = prof.get("inbounds") or []
             inb_uuids = [i["uuid"] for i in inbounds]
-            node = await rw.create_node(name, server.host, 2222, prof["uuid"], inb_uuids,
+            node = await rw.create_node(name, server.host, spec.node_port, prof["uuid"], inb_uuids,
                                         (values.get("country") or "XX").upper()[:2])
-            report.append(f"🛰 Нода создана в панели: <code>{h(node.get('uuid'))}</code>")
+            report.append(f"🛰 Нода в панели: порт {spec.node_port}")
             for inb in inbounds:
                 try:
                     await rw.create_host(f"{name} {inb.get('tag')}", domains[0] if domains else server.host,
                                          inb.get("port") or 443, prof["uuid"], inb["uuid"],
                                          sni=domains[0] if domains else None)
-                    report.append(f"🌐 Хост {h(inb.get('tag'))}")
+                    report.append(f"🌐 Хост {h(inb.get('tag'))} → {h(domains[0] if domains else server.host)}:{inb.get('port')}")
                 except RwError as e:
                     report.append(f"⚠️ Хост {h(inb.get('tag'))}: {h(str(e)[:150])}")
             sq = values["squad"]
             if sq == "new":
-                await rw.create_squad(values["squad_name"], inb_uuids)
-                report.append(f"👥 Сквад <b>{h(values['squad_name'])}</b> создан")
+                await rw.create_squad(name, inb_uuids)
+                report.append(f"👥 Сквад <b>{h(name)}</b> создан")
             elif sq != "skip":
                 cur = next((s for s in await rw.squads() if s["uuid"] == sq), {})
                 have = [i["uuid"] if isinstance(i, dict) else i for i in cur.get("inbounds") or []]
@@ -458,13 +551,15 @@ async def node_add_done(event, values, ctx):
 
     n = await db.save(db.Node(panel_id=p.id, server_id=server.id, name=name, domain=",".join(domains) or None,
                               rw_uuid=node.get("uuid"), profile_uuid=prof["uuid"]))
+    await db.set_setting(f"nodespec:{n.id}", json.dumps(spec.to_json()))
     panel_srv = await db.get(db.Server, p.server_id)
     panel_ip = await _resolve(panel_srv.host if panel_srv else p.domain)
-    await say(event, "\n".join(report))
-    res = await run_task(event.bot, chat_id(event), server, f"Установка ноды {name}",
-                         scripts.node_install(secret, domains, selfsteal, panel_ip, email))
-    await say(event, f"{'✅' if res.ok else '⚠️'} Нода <b>{h(name)}</b> готова. Через минуту она должна стать 🟢.\n"
-                     "Проверь в подписке, что у Reality стоит <code>flow=xtls-rprx-vision</code>.",
+    res = await run_task(event.bot, chat_id(event), server, f"Установка ноды {name} ({spec.ct})",
+                         scripts.node_install(secret, spec, panel_ip, email))
+    await say(event, ("✅" if res.ok else "⚠️") + f" Нода <b>{h(name)}</b>\n" + "\n".join(report) +
+              f"\n📦 Контейнер <code>{h(spec.ct)}</code> · {h(spec.dir)} · сертификат <code>{h(spec.cert)}</code>"
+              + ("\n\nЧерез минуту нода станет 🟢. Проверь в подписке <code>flow=xtls-rprx-vision</code>." if res.ok else
+                 "\n\nНода в панели создана, но установка на сервере не прошла — лог выше. Исправь и нажми «🛰 К ноде» → переустановить."),
               kb([("🛰 К ноде", f"nd:v:{n.id}"), ("🛰 Ноды", f"pn:nodes:{p.id}")]))
 
 
@@ -480,7 +575,7 @@ async def node_add(c: CallbackQuery, state: FSMContext):
     p = await db.get(db.Panel, c.data.split(":")[2])
     if not has_api(p):
         return await c.answer("Сначала задай доступ к API панели (токен или логин/пароль)", show_alert=True)
-    await start_form(c, state, "node_add", ctx={"panel": p.id})
+    await start_form(c, state, "node_add", ctx={"panel": p.id}, preset={"panel": p.id})
 
 
 # ------------------------------------------------------------------ сертификат ноды (certbot, cert-name key)
@@ -502,8 +597,9 @@ async def cert_action(c: CallbackQuery):
     kind, i = c.data.split(":")[1], c.data.split(":")[2]
     n = await db.get(db.Node, i)
     if s := await _node_server(c, n):
-        script, title = {"st": (scripts.CERT_STATUS, "статус"), "dry": (scripts.CERT_DRYRUN, "dry-run"),
-                         "renew": (scripts.CERT_RENEW, "продление")}[kind]
+        spec = await spec_of(n)
+        script, title = {"st": (scripts.cert_status(spec), "статус"), "dry": (scripts.CERT_DRYRUN, "dry-run"),
+                         "renew": (scripts.cert_renew(spec), "продление")}[kind]
         await c.answer()
         await run_task(c.bot, c.message.chat.id, s, f"Сертификат {n.name}: {title}", script)
 
@@ -522,7 +618,7 @@ async def crt_add_done(event, values, ctx):
     new = [d for d in values["domains"].split(",") if d]
     allds = list(dict.fromkeys(old + new))
     res = await run_task(event.bot, chat_id(event), s, f"Сертификат {n.name}: {', '.join(allds)}",
-                         scripts.cert_issue(allds, await db.setting("acme_email") or None, expand=True))
+                         scripts.cert_issue(await spec_of(n), allds, await db.setting("acme_email") or None, expand=True))
     if not res.ok:
         return await say(event, "⚠️ Сертификат не выпущен — домены не сохраняю.")
     n.domain = ",".join(allds)

@@ -1,4 +1,5 @@
 """Генераторы bash-скриптов. Всё, что приходит от пользователя, экранируется через shlex.quote."""
+from dataclasses import asdict, dataclass, field
 from shlex import quote as q
 
 BEDOLAGA_DIR = "/opt/remnawave-bedolaga-telegram-bot"
@@ -301,7 +302,7 @@ docker compose up -d
 """)
 
 
-# ===================================================================== Нода (self-steal по мануалу)
+# ===================================================================== Нода (self-steal по мануалу, несколько нод на сервер)
 NGINX_SS_DIR = "/opt/nginx-selfsteal"
 
 SELFSTEAL_HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Сайт в разработке</title>
@@ -309,12 +310,58 @@ SELFSTEAL_HTML = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><
 <style>body{font-family:system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:#f4f4f5;color:#27272a}main{text-align:center;padding:24px}h1{font-weight:600}</style>
 </head><body><main><h1>Сайт в разработке</h1><p>Скоро здесь что-то появится.</p></main></body></html>"""
 
-NGINX_SS_CONF = """server {
-    listen 8443 ssl default_server;
+
+@dataclass
+class NodeSpec:
+    """Где и как живёт нода на сервере. Значения по умолчанию = мануал (одна нода на сервер)."""
+    ct: str = "remnanode"  # имя контейнера remnanode
+    node_port: int = 2222  # NODE_PORT — порт для связи панели с нодой
+    ss_port: int = 8443  # локальный порт Nginx self-steal (target Reality)
+    reality_port: int | None = 443  # TCP
+    hy2_port: int | None = 443  # UDP
+    domains: list = field(default_factory=list)
+    selfsteal: bool = True
+
+    @property
+    def default(self) -> bool:
+        return self.ct == "remnanode"
+
+    @property
+    def dir(self) -> str:
+        return f"/opt/{self.ct}"
+
+    @property
+    def ss_ct(self) -> str:
+        return "nginx-selfsteal" if self.default else f"{self.ct}-selfsteal"
+
+    @property
+    def ss_dir(self) -> str:
+        return NGINX_SS_DIR if self.default else f"/opt/{self.ct}-selfsteal"
+
+    @property
+    def cert(self) -> str:
+        return "key" if self.default else self.ct
+
+    @property
+    def cron(self) -> str:
+        return "/etc/cron.d/vpn-master-certbot" + ("" if self.default else f"-{self.ct}")
+
+    def to_json(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, d: dict | None) -> "NodeSpec":
+        d = d or {}
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+def _ss_conf(spec: NodeSpec) -> str:
+    return f"""server {{
+    listen {spec.ss_port} ssl default_server;
     server_name _;
 
-    ssl_certificate     /etc/letsencrypt/live/key/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/key/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/{spec.cert}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{spec.cert}/privkey.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
     server_tokens off;
@@ -322,61 +369,89 @@ NGINX_SS_CONF = """server {
     root /usr/share/nginx/html;
     index index.html;
 
-    location / {
+    location / {{
         try_files $uri $uri/ =404;
-    }
-}"""
+    }}
+}}"""
 
 
-def _certbot_issue(domains: list[str], email: str | None, expand: bool = False) -> str:
+def _certbot_issue(domains: list[str], email: str | None, expand: bool = False, cert: str = "key") -> str:
     ds = " ".join(f"-d {q(d)}" for d in domains)
     mail = f"--email {q(email)}" if email else "--register-unsafely-without-email"
     return f"""
-log "Выпускаю сертификат (cert-name key): {' '.join(domains)}"
+log "Выпускаю сертификат (cert-name {cert}): {' '.join(domains)}"
 certbot_compose && cd {CERTBOT_DIR}
 if ss -ltnH 2>/dev/null | awk '{{print $4}}' | grep -qE '(^|:)80$'; then
   echo "!! Порт 80 занят — certbot --standalone не сможет пройти проверку:"; ss -ltnp | grep -E ':80\\b' || true; exit 4
 fi
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then ufw allow 80/tcp >/dev/null; fi
 docker compose run --rm -T certbot certonly --standalone --non-interactive --agree-tos {mail} \\
-  --cert-name key {'--expand ' if expand else ''}{ds} </dev/null
-ls -l {CERTBOT_DIR}/certs/live/key/
+  --cert-name {q(cert)} {'--expand ' if expand else ''}{ds} </dev/null
+ls -l {CERTBOT_DIR}/certs/live/{cert}/
 """
 
 
-CERT_RENEW_CRON = f"""
-cat > /etc/cron.d/vpn-master-certbot <<'VMEOF'
-0 0 28 * * root cd {CERTBOT_DIR} && docker compose run --rm certbot renew >> /var/log/vpn-master-certbot.log 2>&1 && docker exec nginx-selfsteal nginx -s reload && docker restart remnanode
+def _renew_cron(spec: NodeSpec) -> str:
+    return f"""
+cat > {spec.cron} <<'VMEOF'
+0 0 28 * * root cd {CERTBOT_DIR} && docker compose run --rm -T certbot renew >> /var/log/vpn-master-certbot.log 2>&1 </dev/null; docker exec {spec.ss_ct} nginx -s reload; docker restart {spec.ct}
 VMEOF
-chmod 644 /etc/cron.d/vpn-master-certbot
-log "Автопродление: /etc/cron.d/vpn-master-certbot (28 числа каждого месяца)"
+chmod 644 {spec.cron}
+log "Автопродление: {spec.cron} (28 числа каждого месяца)"
 """
 
 
-def node_install(secret_key: str, domains: list[str], selfsteal: bool, panel_ip: str | None,
-                 email: str | None = None) -> str:
-    parts = ["need_docker", "pkg cron iproute2 || true",
-             # старый вариант self-steal на Caddy (ранние версии бота) — убираем
-             "docker rm -f selfsteal >/dev/null 2>&1 || true"]
-    if selfsteal and domains:
-        parts.append(_certbot_issue(domains, email))
+def _port_checks(spec: NodeSpec) -> str:
+    """Порты должны быть свободны (кроме случая, когда переустанавливаем ту же ноду)."""
+    checks = [("tcp", spec.node_port, "NODE_PORT")]
+    if spec.selfsteal:
+        checks.append(("tcp", spec.ss_port, "self-steal"))
+    if spec.reality_port:
+        checks.append(("tcp", spec.reality_port, "Reality"))
+    if spec.hy2_port:
+        checks.append(("udp", spec.hy2_port, "Hysteria2"))
+    lines = "\n".join(f"busy {proto} {port} {q(label)}" for proto, port, label in checks)
+    return f"""
+busy(){{ # proto port label
+  local flag=-ltnH; [ "$1" = udp ] && flag=-lunH
+  if ss $flag 2>/dev/null | awk '{{print $4}}' | grep -qE "(^|:)$2$"; then
+    echo "!! $1-порт $2 ($3) уже занят:"; ss $flag -p 2>/dev/null | grep -E ":$2\\b" || true; BUSY=1
+  fi
+}}
+BUSY=0
+if docker ps -a --format '{{{{.Names}}}}' | grep -qxE {q(spec.ct + '|' + spec.ss_ct)}; then
+  log "Нода {spec.ct} уже есть — переустанавливаю (проверку портов пропускаю)"
+else
+{lines}
+fi
+[ "$BUSY" = 1 ] && {{ echo "!! Выбери другие порты (или имя контейнера) — установка остановлена"; exit 5; }}
+"""
+
+
+def node_install(secret_key: str, spec: NodeSpec, panel_ip: str | None, email: str | None = None) -> str:
+    parts = ["need_docker", "pkg cron iproute2 || true", _port_checks(spec)]
+    if spec.default:
+        parts.append("docker rm -f selfsteal >/dev/null 2>&1 || true")  # Caddy self-steal ранних версий
+    if spec.selfsteal and spec.domains:
+        d0 = spec.domains[0]
+        parts.append(_certbot_issue(spec.domains, email, cert=spec.cert))
         parts.append(f"""
-log "Ставлю Nginx self-steal на 127.0.0.1:8443"
-mkdir -p {NGINX_SS_DIR}/html && cd {NGINX_SS_DIR}
+log "Ставлю Nginx self-steal ({spec.ss_ct}) на 127.0.0.1:{spec.ss_port}"
+mkdir -p {spec.ss_dir}/html && cd {spec.ss_dir}
 [ -f html/index.html ] || cat > html/index.html <<'VMEOF'
 {SELFSTEAL_HTML}
 VMEOF
 cat > default.conf <<'VMEOF'
-{NGINX_SS_CONF}
+{_ss_conf(spec)}
 VMEOF
 cat > docker-compose.yml <<'VMEOF'
 services:
-  nginx-selfsteal:
+  {spec.ss_ct}:
     image: nginx:stable-alpine
-    container_name: nginx-selfsteal
+    container_name: {spec.ss_ct}
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:{spec.ss_port}:{spec.ss_port}"
     volumes:
       - ./default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./html:/usr/share/nginx/html:ro
@@ -384,19 +459,19 @@ services:
 VMEOF
 docker compose up -d
 sleep 2
-docker exec nginx-selfsteal nginx -t
-code=$(curl -sk -o /dev/null -w '%{{http_code}}' --max-time 5 --resolve {q(domains[0])}:8443:127.0.0.1 https://{domains[0]}:8443/ || true)
+docker exec {spec.ss_ct} nginx -t
+code=$(curl -sk -o /dev/null -w '%{{http_code}}' --max-time 5 --resolve {q(d0)}:{spec.ss_port}:127.0.0.1 https://{d0}:{spec.ss_port}/ || true)
 log "Self-steal отвечает: HTTP $code"
 """)
-        parts.append(CERT_RENEW_CRON)
+        parts.append(_renew_cron(spec))
     parts.append(f"""
-log "Ставлю Remnawave Node"
-mkdir -p /opt/remnanode {CERTBOT_DIR}/certs && cd /opt/remnanode
+log "Ставлю Remnawave Node: контейнер {spec.ct}, NODE_PORT {spec.node_port}"
+mkdir -p {spec.dir} {CERTBOT_DIR}/certs && cd {spec.dir}
 cat > docker-compose.yml <<'VMEOF'
 services:
-  remnanode:
-    container_name: remnanode
-    hostname: remnanode
+  {spec.ct}:
+    container_name: {spec.ct}
+    hostname: {spec.ct}
     image: remnawave/node:latest
     restart: always
     network_mode: host
@@ -405,48 +480,70 @@ services:
         soft: 1048576
         hard: 1048576
     environment:
-      NODE_PORT: "2222"
+      NODE_PORT: "{spec.node_port}"
       SECRET_KEY: "{secret_key}"
     volumes:
       - {CERTBOT_DIR}/certs:/etc/letsencrypt:ro
 VMEOF
 docker compose up -d --force-recreate
 """)
-    if panel_ip:
-        parts.append(f"""
+    rules = ["80/tcp"] + ([f"{spec.reality_port}/tcp"] if spec.reality_port else []) + \
+            ([f"{spec.hy2_port}/udp"] if spec.hy2_port else [])
+    allow_panel = f"ufw allow from {q(panel_ip)} to any port {spec.node_port} proto tcp" if panel_ip else \
+        f"ufw allow {spec.node_port}/tcp"
+    parts.append(f"""
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
-  ufw allow from {q(panel_ip)} to any port 2222 proto tcp
-  ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp
+  {allow_panel}
+  {'; '.join('ufw allow ' + r for r in rules)}
 fi
 """)
-    parts.append("sleep 3; docker ps --format 'table {{.Names}}\\t{{.Status}}'\n"
-                 "ss -lntup 2>/dev/null | grep -E ':(443|8443|2222)\\b' || true")
+    ports = "|".join(str(x) for x in (spec.node_port, spec.ss_port, spec.reality_port, spec.hy2_port) if x)
+    parts.append(f"sleep 3; docker ps --filter name={q(spec.ct)} --format 'table {{{{.Names}}}}\\t{{{{.Status}}}}'\n"
+                 f"ss -lntup 2>/dev/null | grep -E ':({ports})\\b' || true")
     return _script("\n".join(parts))
 
 
-def cert_issue(domains: list[str], email: str | None, expand: bool = True) -> str:
-    """Перевыпуск/расширение сертификата key (добавить домены) + перезапуск nginx и ноды."""
-    return _script(_certbot_issue(domains, email, expand=expand) + """
-docker exec nginx-selfsteal nginx -s reload 2>/dev/null || true
-docker restart remnanode >/dev/null && log "remnanode перезапущен"
-""" + CERT_RENEW_CRON)
+def cert_issue(spec: NodeSpec, domains: list[str], email: str | None, expand: bool = True) -> str:
+    """Перевыпуск/расширение сертификата ноды + перезапуск её nginx и контейнера."""
+    return _script(_certbot_issue(domains, email, expand=expand, cert=spec.cert) + f"""
+docker exec {spec.ss_ct} nginx -s reload 2>/dev/null || true
+docker restart {spec.ct} >/dev/null && log "{spec.ct} перезапущен"
+""" + _renew_cron(spec))
 
 
-CERT_RENEW = _script(f"""
+def cert_renew(spec: NodeSpec) -> str:
+    return _script(f"""
 cd {CERTBOT_DIR} && docker compose run --rm -T certbot renew </dev/null
-docker exec nginx-selfsteal nginx -s reload 2>/dev/null || true
-docker restart remnanode >/dev/null && log "remnanode перезапущен"
+docker exec {spec.ss_ct} nginx -s reload 2>/dev/null || true
+docker restart {spec.ct} >/dev/null && log "{spec.ct} перезапущен"
 """)
+
+
 CERT_DRYRUN = _script(f"cd {CERTBOT_DIR} && docker compose run --rm -T certbot renew --dry-run </dev/null")
-CERT_STATUS = _script(f"""
-cd {CERTBOT_DIR} 2>/dev/null && docker compose run --rm -T certbot certificates </dev/null || echo "certbot не установлен"
-cat /etc/cron.d/vpn-master-certbot 2>/dev/null || echo "крон автопродления не найден"
+
+
+def cert_status(spec: NodeSpec) -> str:
+    return _script(f"""
+cd {CERTBOT_DIR} 2>/dev/null && docker compose run --rm -T certbot certificates --cert-name {q(spec.cert)} </dev/null || echo "certbot не установлен"
+cat {spec.cron} 2>/dev/null || echo "крон автопродления не найден"
 """)
-NODE_CHECK = _script("""
-docker ps --format 'table {{.Names}}\\t{{.Status}}'
-echo; ss -lntup 2>/dev/null | grep -E ':(443|8443|2222)\\b' || true
-echo; docker logs --tail 15 remnanode 2>&1 || true
+
+
+def node_check(spec: NodeSpec) -> str:
+    ports = "|".join(str(x) for x in (spec.node_port, spec.ss_port, spec.reality_port, spec.hy2_port) if x)
+    return _script(f"""
+docker ps --format 'table {{{{.Names}}}}\\t{{{{.Status}}}}' | grep -E 'NAMES|{spec.ct}' || true
+echo; ss -lntup 2>/dev/null | grep -E ':({ports})\\b' || true
+echo; docker logs --tail 15 {q(spec.ct)} 2>&1 || true
 """)
+
+
+def node_update(spec: NodeSpec) -> str:
+    return _script(_compose_restart(spec.dir) + "\ndocker image prune -f >/dev/null || true")
+
+
+def selfsteal_update(spec: NodeSpec) -> str:
+    return _script(_compose_restart(spec.ss_dir))
 
 
 # ===================================================================== Bedolaga
@@ -818,8 +915,6 @@ UPDATES = {
     "subpage": _script(_compose_restart("/opt/remnawave/subscription")),
     "caddy": _script(_compose_restart(CADDY_DIR) + "\ncaddy_networks"),
     "nginx": _script(_compose_restart(NGINX_DIR) + "\nproxy_networks nginx"),
-    "node": _script(_compose_restart("/opt/remnanode") + "\ndocker image prune -f >/dev/null || true"),
-    "selfsteal": _script(_compose_restart(NGINX_SS_DIR)),
     "cabinet": _script(_compose_restart(CABINET_DIR)),
     "link_extractor": _script("cd /opt/link-extractor && git pull --ff-only && docker compose up -d --build"),
     "backup_restore": BACKUP_RESTORE_UPDATE,

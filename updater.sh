@@ -5,6 +5,7 @@
 #   autoupdate.interval — минуты между проверками (0 = только по кнопке)
 #   autoupdate.branch   — ветка (по умолчанию main)
 #   update.request      — разовая проверка/обновление «сейчас»
+#   shutdown.request    — бот переехал на другой сервер: гасим этот экземпляр насовсем
 # Результат: ./data/update.status (key=value), лог: ./data/updater.log
 set -u
 D=./data
@@ -29,6 +30,17 @@ status(){ # result [message]
 status idle
 log "updater запущен ($(git rev-parse --short HEAD 2>/dev/null))"
 while true; do
+  if [ -f "$D/shutdown.request" ]; then
+    rm -f "$D/shutdown.request"
+    log "бот переехал ($(cat "$D/migrated.flag" 2>/dev/null)) — останавливаю этот экземпляр"
+    status migrated "бот переехал на другой сервер"
+    sleep 15  # даём старому боту дописать сообщения
+    docker update --restart=no vpn-master vpn-master-db vpn-master-updater >>"$D/updater.log" 2>&1
+    docker compose stop bot db >>"$D/updater.log" 2>&1
+    log "остановлено; updater выходит"
+    exit 0
+  fi
+  [ -f "$D/migrated.flag" ] && { sleep 20; continue; }
   INTERVAL=$(cat "$D/autoupdate.interval" 2>/dev/null | tr -dc 0-9); INTERVAL=${INTERVAL:-0}
   BRANCH=$(cat "$D/autoupdate.branch" 2>/dev/null | tr -dc 'A-Za-z0-9._/-'); BRANCH=${BRANCH:-main}
   NOW=$(date +%s); LAST=$(cat "$D/autoupdate.last" 2>/dev/null | tr -dc 0-9); LAST=${LAST:-0}

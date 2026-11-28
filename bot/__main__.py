@@ -8,7 +8,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
-from . import config, crypto, db, forms
+from . import config, crypto, db, forms, runtime
 from .ui import CTX, SCREENS
 from .handlers import bedolaga, common, install, keys, linkext, mods, panels, security, servers, updates
 
@@ -63,13 +63,32 @@ async def main() -> None:
     await bot.set_my_commands([BotCommand(command="menu", description="Главное меню"),
                                BotCommand(command="cancel", description="Отменить ввод"),
                                BotCommand(command="term", description="Терминал на сервере (открыть/закрыть)")])
+    if runtime.is_migrated():
+        # бот переехал на другой сервер: этот экземпляр не должен забирать обновления у нового
+        logging.warning("Бот переехал (%s) — этот экземпляр спит. Удалите data/migrated.flag, чтобы вернуть.",
+                        runtime.flag_path().read_text().strip())
+        await asyncio.Event().wait()
+    runtime.dp = dp
     asyncio.create_task(common.autobackup_loop(bot))
     await common.notify_if_updated(bot)
     try:
         await bot.send_message(config.OWNER_ID, "🛰 VPN Master запущен. /menu")
     except Exception:  # noqa: BLE001
         pass
-    await dp.start_polling(bot)
+    while True:
+        await dp.start_polling(bot, close_bot_session=False)
+        if runtime.mode == "switching":  # умный переезд: ждём, чем кончится переключение
+            await runtime.switch_done.wait()
+        if runtime.mode == "rollback":  # новый не поднялся — работаем дальше здесь
+            runtime.mode = None
+            runtime.switch_done.clear()
+            logging.warning("Переезд откатан — возобновляю polling")
+            continue
+        if runtime.mode == "migrated":
+            logging.warning("Бот переехал — этот экземпляр спит")
+            await asyncio.Event().wait()
+        break
+    await bot.session.close()
 
 
 if __name__ == "__main__":

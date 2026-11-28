@@ -110,3 +110,11 @@ async def check(server: db.Server, use_password: bool = True) -> tuple[bool, str
         return ("VM_OK" in out and code == 0), out.replace("VM_OK\n", "").strip()
     except Exception as e:  # noqa: BLE001
         return False, f"{type(e).__name__}: {e}"
+
+
+async def upload(server: db.Server, local_path: str, remote_path: str) -> None:
+    """Загрузить файл на сервер по SFTP."""
+    conn = await open_server(server)
+    async with conn:
+        async with conn.start_sftp_client() as sftp:
+            await sftp.put(local_path, remote_path)

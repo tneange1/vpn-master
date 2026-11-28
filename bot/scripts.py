@@ -1020,5 +1020,67 @@ def cabinet_cmd(cab_ct: str, action: str) -> str:
     return _script(cmds[action])
 
 
+# ===================================================================== Умный переезд бота
+VM_REPO = "https://github.com/tneange1/vpn-master"
+VM_DIR = "/opt/vpn-master"
+MIGRATE_UPLOAD = "/tmp/vpn-master-migrate.tar.gz"
+
+
+def migrate_prepare(bot_token: str, owner_id: int, branch: str = "main") -> str:
+    """Новый сервер: Docker, код бота, .env, сборка образа, запуск только БД. Бот пока НЕ запускаем."""
+    return _script(f"""
+need_docker
+pkg git openssl
+D={VM_DIR}
+if [ -d "$D/.git" ]; then
+  log "Код уже есть — обновляю до {branch}"
+  git -C "$D" fetch -q origin {q(branch)} && git -C "$D" reset -q --hard origin/{q(branch)}
+else
+  log "Клонирую {VM_REPO}"
+  git clone -q -b {q(branch)} {VM_REPO} "$D"
+fi
+cd "$D"
+PW=$(get_env .env POSTGRES_PASSWORD)   # повторная попытка — пароль БД тот же
+[ -n "$PW" ] || PW=$(openssl rand -hex 16)
+umask 077
+printf 'BOT_TOKEN=%s\\nOWNER_ID=%s\\nPOSTGRES_PASSWORD=%s\\n' {q(bot_token)} {q(str(owner_id))} "$PW" > .env
+mkdir -p data
+docker compose stop bot updater >/dev/null 2>&1 || true
+log "Собираю образ бота"
+docker compose build bot
+log "Запускаю PostgreSQL"
+docker compose up -d db
+for i in $(seq 1 60); do
+  docker compose exec -T db pg_isready -U vpnmaster -d vpnmaster >/dev/null 2>&1 && break; sleep 2
+done
+docker compose exec -T db pg_isready -U vpnmaster -d vpnmaster
+""")
+
+
+MIGRATE_RESTORE = _script(f"""
+cd {VM_DIR}
+mv -f {MIGRATE_UPLOAD} data/migrate.tar.gz
+rm -f data/migrated.flag data/shutdown.request
+log "Восстанавливаю базу и ключ шифрования из бэкапа"
+docker compose run --rm --no-deps -T bot python -m bot.restore_cli /app/data/migrate.tar.gz </dev/null
+rm -f data/migrate.tar.gz
+""")
+
+MIGRATE_START = _script(f"""
+cd {VM_DIR}
+log "Запускаю бота и автообновление"
+docker compose up -d
+for i in $(seq 1 60); do
+  if docker logs vpn-master 2>&1 | grep -q "Start polling"; then mark STARTED 1; log "Новый бот принимает обновления"; break; fi
+  if ! docker ps --format '{{{{.Names}}}}' | grep -qx vpn-master; then echo "!! контейнер vpn-master не запущен"; break; fi
+  sleep 3
+done
+docker compose ps
+docker logs --tail 20 vpn-master 2>&1 | grep -v -i token || true
+""")
+
+MIGRATE_STOP = _script(f"cd {VM_DIR} && docker compose stop bot updater && docker compose ps")
+
+
 def custom(cmd: str) -> str:
     return "#!/usr/bin/env bash\n" + cmd + "\n"

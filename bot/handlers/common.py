@@ -9,6 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from .. import backup, config, db, selfupdate, terminal
+from ..forms import form
 from ..ui import Card, card_html, h, kb, say, show
 
 router = Router(name="common")
@@ -89,7 +90,47 @@ async def bot_menu(c: CallbackQuery):
     st = selfupdate.status()
     ver = f"<code>{h(st.get('commit', '?'))}</code> {h(st.get('subject', ''))}" if st else "updater не запущен"
     await show(c, f"⚙️ <b>Бот</b>\nВерсия: {ver}",
-               kb([("💾 Бэкап бота", "bk"), ("🔄 Обновление", "su")], [("⬅️ Меню", "menu")]))
+               kb([("💾 Бэкап бота", "bk"), ("🔄 Обновление", "su")],
+                  [("🚚 Умный переезд на другой сервер", "mig", "primary")], [("⬅️ Меню", "menu")]))
+
+
+# ------------------------------------------------------------------ 🚚 умный переезд
+@router.callback_query(F.data == "mig")
+async def mig_menu(c: CallbackQuery, state: FSMContext):
+    from ..forms import start_form
+    await start_form(c, state, "migrate", preset={"server": "new"})
+
+
+def _mig_fields():
+    from .servers import SERVER_FIELDS
+    return SERVER_FIELDS
+
+
+@form("migrate", "🚚 Умный переезд бота", _mig_fields())
+async def mig_done(event, values, ctx):
+    from .servers import ensure_server
+    try:
+        s = await ensure_server(event, values)
+    except RuntimeError as e:
+        return await say(event, f"❌ {h(e)}", kb([("🔁 Ещё раз", "mig")]))
+    await say(event, f"🚚 <b>Переезд на {h(s.host)}</b>\n\n"
+                     "1. Свежий бэкап бота (копия придёт сюда).\n"
+                     "2. На новом сервере: Docker, код бота, сборка, PostgreSQL.\n"
+                     "3. Перенос бэкапа и восстановление базы с ключом шифрования.\n"
+                     "4. Переключение: этот бот замолкает, запускается новый. Если новый не поднимется — "
+                     "этот вернётся сам.\n\n"
+                     "Займёт 3–10 минут. Пока идёт переезд, кнопки могут не отвечать.",
+              kb([("🚚 Переехать", f"mig:go:{s.id}", "success")], [("✖️ Отмена", "bot")]))
+
+
+@router.callback_query(F.data.startswith("mig:go:"))
+async def mig_go(c: CallbackQuery):
+    from .. import migrate
+    s = await db.get(db.Server, c.data.split(":")[2])
+    if not s:
+        return await c.answer("Сервер не найден", show_alert=True)
+    await c.answer("Поехали 🚚")
+    asyncio.create_task(migrate.migrate(c.bot, c.message.chat.id, s))
 
 
 RESULT = {"idle": "ещё не проверял", "uptodate": "✅ последняя версия", "available": "🆕 есть обновление",
